@@ -1,166 +1,133 @@
 # rexweb
 
-Native WebKit browser panes for [Rex](https://www.superlogical.com/rex), the
-terminal multiplexer by [Superlogical](https://www.superlogical.com).
+Browser panes for [Rex](https://www.superlogical.com/rex). Real WebKit, the
+engine Safari uses, right beside your terminal, and scriptable by you and your
+agents.
 
-Press `Shift-Cmd-B`. A browser pane opens beside the current pane. It's the
-engine Safari uses, with an address bar, back, forward, and reload. It follows
-its pane through splits, resizes, tabs, and zoom, and its title shows in the
-pane's header. Agents drive the same pane from the command line.
-
-```sh
-rexweb open localhost:3000
-rexweb snapshot          # [e1] link "Docs" -> /docs, [e2] button "Sign in", ...
-rexweb click e2
-rexweb type --submit 'input[name=email]' 'me@example.com'
-rexweb screenshot ~/Desktop/after.png
-```
+<img src="docs/hero.png" alt="A Rex window with a shell on the left running rexweb commands, and a browser pane on the right showing a to-do app on localhost:3000 that the commands just added a task to.">
 
 ## Install
 
-rexweb needs macOS 14 or later, Rex, `jq`, and the Xcode command line tools.
-From a checkout, run:
+You need macOS 14 or later, [Rex](https://www.superlogical.com/rex/docs/installation),
+`jq`, and the Xcode command line tools.
 
 ```sh
-./install.sh
+git clone https://github.com/acoyfellow/rexweb
+cd rexweb && ./install.sh
 ```
 
-The installer builds `RexWeb.app` into `~/Applications`, links the `rexweb`
-command into `~/.local/bin`, and adds `require("rexweb").setup{}` to
-`~/.config/rex/init.lua`. Run it again to update.
+Run `./install.sh` again to update. `./uninstall.sh` removes everything;
+add `--purge` to delete cookies and site data too.
 
-## Usage
+## Use it
 
-Press **`Shift-Cmd-B`** in Rex to open a browser pane. It's also in the command
-palette as **Open Browser Pane** and **Open Browser Tab**, and on the command
-line:
+Press **`Shift-Cmd-B`** in Rex, or pick **Open Browser Pane** from the command
+palette. From a shell:
 
 ```sh
-rexweb open github.com                  # beside this pane
-rexweb open 5173 --split=below --ratio 40  # localhost:5173, below this pane
-rexweb open --tab docs.rs               # in a new tab
-rex do rexweb_open url=example.com      # the same action the shortcut runs
+rexweb open localhost:3000
+rexweb open docs.rs --split=below --ratio 40
+rexweb open --tab github.com
 ```
 
-Close the pane like any Rex pane. In a browser pane:
+A browser pane behaves like any other Rex pane. Split it, resize it, zoom it,
+move it to another tab, or close it. Its header shows the page's title.
 
-| Key | Does |
+| In a browser pane | |
 | --- | --- |
-| `Cmd-L` | Focus the address bar |
-| `Cmd-R`, `Shift-Cmd-R` | Reload, or reload without the cache |
-| `Cmd-[`, `Cmd-]` | Back, forward |
-| `Cmd-+`, `Cmd--`, `Cmd-0` | Zoom in, out, reset |
-| `Cmd-W` | Close the pane |
-| `Ctrl-Opt-Arrow` | Move focus to the Rex pane in that direction |
-| `Cmd`-click a link | Open it in a new browser pane |
+| `Cmd-L` | Address bar |
+| `Cmd-R` | Reload |
+| `Cmd-[` / `Cmd-]` | Back / forward |
+| `Cmd-+` / `Cmd--` / `Cmd-0` | Zoom |
+| `Cmd`-click a link | Open it in a new pane |
+| `Ctrl-Opt-Arrow` | Back to the Rex pane in that direction |
 
-Moving Rex's focus onto a browser pane gives it the keyboard. Right-click and
-choose **Inspect Element** for Web Inspector.
+Right-click and choose **Inspect Element** for Web Inspector.
 
-## Agents
+## Drive it from scripts and agents
 
-Every command that acts on a pane takes `-b BLOCK`: the pane's block ID, an ID
-suffix, or its label. Without it, rexweb uses the browser pane you used most
-recently. Most commands take `--json`.
+```sh
+$ rexweb snapshot
+Launch list
+http://localhost:3000/
 
-| Command | Does |
+Elements:
+[e1] text "New task"
+[e2] button "Add"
+[e3] checkbox "Write the README" [checked]
+
+$ rexweb type --submit e1 'Ship it'
+$ rexweb eval 'document.querySelector("#meta").textContent'
+"2 of 4 done"
+```
+
+| Command | |
 | --- | --- |
-| `rexweb ls` | List browser panes |
-| `rexweb nav URL` | Go to URL and wait for it to load |
-| `rexweb snapshot` | Print the interactive elements, numbered `e1`, `e2`, ..., and the page's text |
-| `rexweb click TARGET` | Click `e3` or a CSS selector with a real mouse click |
-| `rexweb type TARGET TEXT` | Type into a field, with `--clear` and `--submit` |
-| `rexweb press KEY` | Press `enter`, `tab`, `escape`, an arrow, and so on |
-| `rexweb eval JS` | Run JavaScript, `await` included, and print the result as JSON |
-| `rexweb wait` | Wait for `--selector`, `--text`, or the page to load |
-| `rexweb screenshot [PATH]` | Save a PNG of the page |
+| `nav URL` | Go to a page and wait for it to load |
+| `snapshot` | Number the page's controls (`e1`, `e2`, ...) and print its text |
+| `click TARGET` | Click `e2` or a CSS selector, with a real mouse click |
+| `type TARGET TEXT` | Fill a field; `--clear`, `--submit` |
+| `press KEY` | `enter`, `tab`, `escape`, arrows, ... |
+| `eval JS` | Run JavaScript, `await` included; prints JSON |
+| `wait` | Until `--selector` matches, `--text` appears, or the page loads |
+| `screenshot [PATH]` | Save a PNG |
+| `back`, `forward`, `reload`, `info`, `ls`, `focus`, `close` | |
 
-Run `rexweb COMMAND --help` for each command's options. The `rexweb` command
-talks to `RexWeb.app` over HTTP on `127.0.0.1:18802`, so any program on your Mac
-can use the same API.
+Commands act on the browser pane you used last. Pass `-b BLOCK` for another
+one, by block ID, ID suffix, or label. Most commands take `--json`, and
+`rexweb COMMAND --help` covers the rest.
 
 ## Signing in
 
-Every browser pane shares one profile, kept between restarts, so you sign in to
+All browser panes share one profile that survives restarts, so you sign in to
 a site once.
 
-Passkeys and security keys don't work in rexweb. macOS offers them only to
-browsers that Apple has approved with a special entitlement, and a build you
-make yourself doesn't have it. On a single sign-on page that only offers a
-passkey, the pane says the sign-in was cancelled or timed out.
-
-Sign in with Chrome instead, then import the sign-in:
+**Passkeys and security keys don't work.** macOS only offers them to browsers
+Apple has approved, and an app you build yourself isn't one. If your single
+sign-on needs a passkey, sign in with Chrome and bring the session over:
 
 ```sh
-rexweb cookies import --domain example.com --reload
+rexweb cookies import --domain example.com --domain idp.example.com --reload
 ```
 
-`--domain` limits the import to that domain and its subdomains. Repeat it for
-each domain your sign-in uses, such as your identity provider's. Without it,
-rexweb imports every cookie in your Chrome profile. The first import asks for
-the **Chrome Safe Storage** key in your Keychain. Once your identity provider's
-session is imported, other sites that sign in through it work without a passkey
-until that session expires.
+macOS asks once for the **Chrome Safe Storage** key. With your identity
+provider's session imported, sites that sign in through it work until that
+session expires. Leave out `--domain` to import every Chrome cookie.
 
-Sign-in popups, which use `window.open`, open in their own window so they can
-report back to the page that opened them.
+Sign-in popups open in their own window, so they can hand the result back to
+the page.
 
 ## Configure
 
-Change the shortcut and where panes open in the `setup` call in
-`~/.config/rex/init.lua`:
+In `~/.config/rex/init.lua`:
 
 ```lua
 require("rexweb").setup{
   key = "shift+cmd+b",  -- false for no shortcut
   split = "right",      -- right, left, above, or below
-  ratio = 0.5,          -- the browser pane's share of the split
-  home = "",            -- the page a new pane opens; empty focuses the address bar
+  ratio = 0.5,          -- the browser's share of the split
+  home = "",            -- a new pane's page; empty focuses the address bar
 }
 ```
 
-`~/.rexweb/config.json` sets the rest. Every key is optional:
-
-```json
-{
-  "search_url": "https://duckduckgo.com/?q=%s",
-  "port": 18802
-}
-```
-
-If a pane doesn't line up with its Rex pane, adjust `top`, `left`, `right`,
-`bottom`, `gap`, and `header`, in points, and restart RexWeb.
+`~/.rexweb/config.json` can set `search_url` (with `%s` for the query) and
+`port`. If a pane ever sits a few points off, `top`, `left`, `right`,
+`bottom`, `gap`, and `header` adjust the fit.
 
 ## How it works
 
-Rex draws its panes itself and has no way to show a web page in one. So each
-browser pane is a terminal pane running `rexweb-pane`, a small program that
-holds the pane, with a borderless WebKit window from `RexWeb.app` laid exactly
-over it.
+<img src="docs/how-it-works.svg" alt="A Rex window holds a terminal pane running rexweb-pane. A WebKit window from RexWeb.app sits exactly over that pane's body. RexWeb.app follows the layout, and the rexweb CLI talks to it over localhost.">
 
-RexWeb reads the layout from `rex api call session.view`, follows changes with
-`rex events`, and finds the Rex window on screen. It keeps each browser window
-directly above its Rex window, below every other app's windows, and hides it
-when its tab isn't showing or another pane is zoomed. When you close the pane,
-`rexweb-pane` exits and RexWeb closes the browser window.
+Rex draws its own panes and can't show a web page in one. So a browser pane is
+a terminal pane running `rexweb-pane`, with a borderless WebKit window from
+`RexWeb.app` laid over it. RexWeb reads the layout from Rex's API, follows it
+with `rex events`, and keeps each window directly above its Rex window, hidden
+whenever its pane isn't on screen.
 
-Because the browser is a separate window from a separate app, clicking into it
-makes RexWeb the active app, and Rex's title bar dims.
-
-## Uninstall
-
-```sh
-./uninstall.sh          # keeps your cookies and site data
-./uninstall.sh --purge  # deletes them too
-```
-
-## Acknowledgements
-
-Thanks to [Superlogical](https://www.superlogical.com) for building Rex. Its Lua
-configuration and open API made this project possible.
-
-rexweb is a community project. Superlogical does not maintain or endorse it.
+One side effect: clicking into a page makes RexWeb the active app, so Rex's
+title bar dims.
 
 ## License
 
-MIT
+MIT. rexweb is a community project. Superlogical doesn't maintain or endorse
+it. Thanks to them for Rex, and for the open API that made this possible.

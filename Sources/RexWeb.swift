@@ -61,6 +61,12 @@ enum Rex {
 
   static func async(_ args: [String]) { queue.async { run(args) } }
 
+  static func isDisplayed(block: String, session: String) -> Bool? {
+    guard let data = run(["block", "call", "-s", session, "-b", block, "size"]),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    return !((o["desired"] as? [Any]) ?? []).isEmpty
+  }
+
   static let labelQueue = DispatchQueue(label: "rexweb.label")
   static var pendingLabels: [String: (String, String)] = [:]
   static let labelLock = NSLock()
@@ -463,6 +469,7 @@ struct RexWindow { let number: Int; let name: String; let bounds: CGRect }
 
 final class Tracker {
   var views: [String: [String: Any]] = [:]
+  var displayed: [String: Bool] = [:]
   var refreshing = Set<String>()
   var dirty = Set<String>()
   var eventsProcess: Process?
@@ -499,10 +506,14 @@ final class Tracker {
   func refresh(_ session: String) {
     if refreshing.contains(session) { dirty.insert(session); return }
     refreshing.insert(session)
+    let ids = App.shared.panels.values.filter { $0.session == session }.map(\.id)
     Rex.queue.async {
       let v = Rex.view(session)
+      var shown: [String: Bool] = [:]
+      for id in ids { if let d = Rex.isDisplayed(block: id, session: session) { shown[id] = d } }
       DispatchQueue.main.async {
         self.refreshing.remove(session)
+        for (id, d) in shown { self.displayed[id] = d }
         if let v { self.views[session] = v; self.reconcile(session) }
         if self.dirty.remove(session) != nil { self.refresh(session) }
       }
@@ -597,7 +608,7 @@ final class Tracker {
     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
 
     for p in panels {
-      guard let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
+      guard displayed[p.id] != false, let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
       let label = v["label"] as? String ?? ""
       guard let rw = rexWins.first(where: { $0.name == "Rex - \(label)" || $0.name == label })
               ?? (rexWins.count == 1 ? rexWins[0] : nil) else { hide(p); continue }
@@ -703,7 +714,7 @@ enum JS {
     let extra = '';
     if (tag === 'a') extra = ' -> ' + el.getAttribute('href');
     if ('checked' in el && (el.type === 'checkbox' || el.type === 'radio')) extra += el.checked ? ' [checked]' : ' [ ]';
-    if ((tag === 'input' || tag === 'textarea') && el.value && el.type !== 'password') extra += ' value=' + JSON.stringify(el.value.slice(0, 60));
+    if ((tag === 'textarea' || (tag === 'input' && !['checkbox','radio','password','hidden','submit','button'].includes(el.type))) && el.value) extra += ' value=' + JSON.stringify(el.value.slice(0, 60));
     if (el.disabled) extra += ' [disabled]';
     lines.push(`[${ref}] ${role} "${name(el)}"${extra}`);
   }
@@ -934,7 +945,7 @@ final class App: NSObject, NSApplicationDelegate {
     guard let p = resolve(input["id"]) else {
       return fail(panels.isEmpty ? "no browser panes; open one with `rexweb open URL`" : "no single pane matches \(input["id"] ?? "")")
     }
-    p.lastActive = Date()
+    if route != "/info" { p.lastActive = Date() }
 
     switch route {
     case "/info":
