@@ -179,7 +179,7 @@ require("rexweb").setup{
 
 RexWeb reads Rex's own settings and follows them. These include the pane style
 (comfortable or compact), the toolbar layout and auto-hide, the sidebar, and
-the pane headers. Floating panes work too. Full screen is not fully tested yet.
+the pane headers. Floating panes and full screen work too.
 
 `~/.rexweb/config.json` has these keys:
 
@@ -201,6 +201,7 @@ Restart RexWeb after you edit the file: `pkill -x RexWeb`.
 
 - Run `rexweb doctor`. It prints one `ok` or `FAIL` line for each check. It exits 1 if any check fails. Fix each `FAIL` line as it says.
 - To restart RexWeb, run `pkill -x RexWeb`. Panes come back within 2 seconds.
+- If the Rex server restarts, browser panes come back as plain shells. Close them and open new ones.
 - If the problem stays, run `./install.sh` again.
 
 ## How it works

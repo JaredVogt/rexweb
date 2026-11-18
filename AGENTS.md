@@ -74,7 +74,9 @@ with Chrome and run `rexweb cookies import --domain ...`.
 2. Restart RexWeb: `pkill -x RexWeb`. Panes come back within 2 seconds.
 3. Read what the pane itself says: `rex capture -b "$id"`. It prints the URL,
    or why it can't reach RexWeb.
-4. Reinstall: `~/src/rexweb/install.sh`.
+4. If the Rex server restarted, old browser panes are now plain shells.
+   Close them and open new ones.
+5. Reinstall: `~/src/rexweb/install.sh`.
 
 ## How it talks
 
