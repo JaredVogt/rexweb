@@ -137,6 +137,9 @@ Without `-b`, a command acts on the most recently used pane. That pane can
 belong to someone else. `-b` also accepts an ID suffix or part of the page title. Most
 commands take `--json`. `rexweb COMMAND --help` shows the rest.
 
+`click`, `type`, and `press` need the pane on screen. If it isn't, they fail
+after about a second. `snapshot`, `eval`, and `screenshot` work either way.
+
 [AGENTS.md](AGENTS.md) is the guide for coding agents. `rexweb skill` prints
 the same guide.
 

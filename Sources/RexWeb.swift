@@ -1300,6 +1300,16 @@ final class App: NSObject, NSApplicationDelegate {
     }
     if route != "/info" { p.lastActive = Date() }
 
+    if ["/click", "/type", "/press"].contains(route), !p.visible {
+      func retry(_ left: Int) {
+        if p.visible { return handle(path: path, input: input, reply: reply) }
+        if left == 0 {
+          return fail("this pane isn't on screen, so it can't take clicks or typing. Show its Rex window and try again. eval, snapshot, and screenshot still work.")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { retry(left - 1) }
+      }
+      return retry(12)
+    }
     switch route {
     case "/info":
       ok(p.info())
@@ -1335,7 +1345,18 @@ final class App: NSObject, NSApplicationDelegate {
         self.js(p, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
       }
     case "/snapshot":
-      js(p, JS.snapshot, ["max": input["max"] ?? 400, "textMax": input["text_max"] ?? 6000]) { v, e in e == nil ? ok(v ?? [:]) : fail(e!) }
+      let args: [String: Any] = ["max": input["max"] ?? 400, "textMax": input["text_max"] ?? 6000]
+      func attempt(_ left: Int) {
+        js(p, JS.snapshot, args) { v, e in
+          if let e { return fail(e) }
+          if v == nil || v is NSNull, left > 0 {
+            return DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { attempt(left - 1) }
+          }
+          guard let v, !(v is NSNull) else { return fail("the page changed while it was read. Run snapshot again.") }
+          ok(v)
+        }
+      }
+      attempt(10)
     case "/click":
       js(p, JS.resolve, ["target": input["target"] as? String ?? ""]) { v, e in
         guard e == nil, let d = v as? [String: Any] else { return fail(e ?? "resolve failed") }

@@ -49,8 +49,9 @@ rexweb close -b "$id"
   still prints the ID, writes `Error: ...` to stderr, and exits 1. Close the
   pane or `nav` it again.
 - `open` warns on stderr if Rex isn't showing the pane. Panes only show while
-  their Rex window is on screen, which doesn't matter for `snapshot`, `eval`,
-  or `screenshot`.
+  their Rex window is on screen. `snapshot`, `eval`, and `screenshot` work
+  either way. `click`, `type`, and `press` need the pane on screen. They wait
+  about a second for it, then exit 1.
 - `nav`, `back`, `forward`, `reload`, `click`, and `type` wait for any page
   load. `nav` and `wait` exit 1 if the page fails to load.
 - `info --json` prints `{id, session, url, title, loading, visible, error}`.
