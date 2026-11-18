@@ -1,0 +1,53 @@
+#!/bin/bash
+# Holds a Rex pane for a RexWeb browser panel. RexWeb draws a native WebKit
+# view over this pane's body; this process keeps the pane alive, re-registers
+# the panel if RexWeb restarts, and closes the panel when the pane goes away.
+set -u
+url="${1:-}"
+port="${REXWEB_PORT:-18802}"
+id="${REX_BLOCK:?rexweb-pane must run inside a Rex pane}"
+session="${REX_SESSION:?rexweb-pane must run inside a Rex pane}"
+focus="${REXWEB_FOCUS:-false}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+post() { curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' -d "$2"; }
+
+app_path() {
+  if [ -n "${REXWEB_APP:-}" ]; then echo "$REXWEB_APP"; return; fi
+  case "$here" in */RexWeb.app/Contents/Resources) echo "${here%/Contents/Resources}"; return ;; esac
+  for a in "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app" "$here/../build/RexWeb.app"; do
+    [ -d "$a" ] && { echo "$a"; return; }
+  done
+}
+
+ensure_app() {
+  post /health '{}' 1 >/dev/null && return 0
+  local app; app="$(app_path)"
+  [ -n "$app" ] || { echo "RexWeb.app not found; run make install in the rexweb repo"; return 1; }
+  open -g "$app"
+  for _ in $(seq 1 50); do post /health '{}' 1 >/dev/null && return 0; sleep 0.1; done
+  return 1
+}
+
+register() {
+  post /register "$(jq -nc --arg id "$id" --arg s "$session" --arg u "$url" --argjson f "$focus" \
+    '{id:$id, session:$s, url:$u, focus:$f}')" >/dev/null
+}
+
+cleanup() { post /close "$(jq -nc --arg id "$id" '{id:$id}')" 1 >/dev/null; exit 0; }
+trap cleanup EXIT HUP INT TERM
+
+printf '\033[?25l\033[2J\033[H\033[2m  rexweb · %s\033[0m\n' "${url:-blank}"
+ensure_app && register
+focus=false
+
+# Heartbeat: remember the current URL, and bring the panel back if RexWeb restarted.
+while true; do
+  sleep 2 & wait $!
+  info="$(post /info "$(jq -nc --arg id "$id" '{id:$id}')" 2)"
+  if [ -n "$info" ] && cur="$(jq -er '.url // empty' <<<"$info" 2>/dev/null)"; then
+    url="$cur"
+  elif ! jq -e '.id' <<<"$info" >/dev/null 2>&1; then
+    ensure_app && register
+  fi
+done

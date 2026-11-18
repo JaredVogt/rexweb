@@ -1,0 +1,488 @@
+#!/bin/bash
+# rexweb: native WebKit browser panes for Rex.
+set -eo pipefail
+
+port="${REXWEB_PORT:-18802}"
+self="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+
+# ---------------------------------------------------------------- help text
+
+help_root() {
+  cat <<'EOF'
+Native WebKit browser panes for Rex.
+
+Usage:
+  rexweb [command] [flags]
+
+Panes:
+  open        Open a browser pane
+  ls, list    List browser panes
+  focus       Give a browser pane the keyboard
+  close       Close a browser pane
+
+Browse:
+  nav         Go to a URL and wait for it to load
+  back        Go back
+  forward     Go forward
+  reload      Reload the page
+  info        Print the page's URL, title, and load state
+
+Automation:
+  snapshot    Print the page's interactive elements and text
+  click       Click an element
+  type        Type text into an element
+  press       Press a key
+  eval        Evaluate JavaScript and print the result
+  wait        Wait for an element, some text, or the page to load
+  screenshot  Save a PNG of the page
+
+Sign-in:
+  cookies     Import cookies, such as a sign-in from Chrome
+
+Options:
+  -h, --help  help for rexweb
+
+Every command that acts on a pane takes -b BLOCK, a pane's ID, ID suffix, or
+label. Without it, rexweb uses the browser pane you used most recently.
+
+Run "rexweb [command] --help" for more information about a command.
+EOF
+}
+
+help_cmd() {
+  case "$1" in
+    open) cat <<'EOF'
+Open a browser pane beside a Rex pane.
+
+URL can be a full URL, a host such as example.com, a port such as 3000 for
+localhost:3000, or words to search for. Without URL, the pane opens with the
+address bar focused. By default the new pane goes to the right of the current
+pane, takes focus, and prints its block ID.
+
+Examples:
+  rexweb open localhost:3000
+  rexweb open https://developers.cloudflare.com --split=below --ratio 40
+  rexweb open --tab github.com
+  rexweb open docs.rs --focus=false
+
+Usage:
+  rexweb open [URL] [flags]
+
+Options:
+      --split DIRECTION  place the pane in DIRECTION from the anchor (right, left, above, or below) (default right)
+      --ratio PCT        give the new pane PCT percent of the split (default 50)
+  -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK, then the focused pane)
+  -s, --session SESSION  open in SESSION (defaults to REX_SESSION)
+      --tab              open the pane in a new tab instead of a split
+      --focus            focus the new pane (default true)
+      --json             output the result as JSON
+EOF
+    ;;
+    ls|list) cat <<'EOF'
+List browser panes, most recently used first.
+
+Usage:
+  rexweb ls [flags]
+
+Options:
+      --json  output panes as JSON
+EOF
+    ;;
+    focus|close|back|forward|reload|info) cat <<EOF
+$(case "$1" in
+  focus) echo "Give a browser pane the keyboard, and show it if its tab isn't active." ;;
+  close) echo "Close a browser pane and the Rex pane that holds it." ;;
+  back) echo "Go back in a browser pane's history and wait for the page to load." ;;
+  forward) echo "Go forward in a browser pane's history and wait for the page to load." ;;
+  reload) echo "Reload a browser pane's page and wait for it to load." ;;
+  info) echo "Print a browser pane's URL, title, and whether it's loading." ;;
+esac)
+
+Usage:
+  rexweb $1 [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --json         output the result as JSON
+EOF
+    ;;
+    nav) cat <<'EOF'
+Go to URL and wait for the page to load.
+
+Examples:
+  rexweb nav localhost:5173
+  rexweb nav -b docs https://developers.cloudflare.com/workers/
+
+Usage:
+  rexweb nav URL [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --json         output the result as JSON
+EOF
+    ;;
+    snapshot) cat <<'EOF'
+Print the page's interactive elements and its text.
+
+Each element gets a reference such as e3, which click and type accept until
+the next snapshot. Links show where they go, and fields show their values.
+
+Examples:
+  rexweb snapshot
+  rexweb snapshot --json | jq -r .elements
+
+Usage:
+  rexweb snapshot [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --json         output the snapshot as JSON
+EOF
+    ;;
+    click) cat <<'EOF'
+Click an element with a real mouse click, then wait for any page load.
+
+TARGET is a reference from snapshot, such as e3 or @e3, or a CSS selector.
+
+Examples:
+  rexweb click e3
+  rexweb click 'button[type=submit]'
+
+Usage:
+  rexweb click TARGET [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
+    type) cat <<'EOF'
+Type text into an element.
+
+TARGET is a reference from snapshot, such as e3, or a CSS selector. Use - to
+type into the focused element.
+
+Examples:
+  rexweb type e2 'hello@example.com'
+  rexweb type --clear --submit 'input[name=q]' 'durable objects'
+
+Usage:
+  rexweb type TARGET TEXT [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --clear        replace the element's text instead of adding to it
+      --submit       submit the element's form afterward
+EOF
+    ;;
+    press) cat <<'EOF'
+Press a key in the page.
+
+KEY is one of enter, tab, escape, space, backspace, delete, up, down, left,
+right, home, end, pageup, or pagedown.
+
+Usage:
+  rexweb press KEY [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
+    eval) cat <<'EOF'
+Evaluate JavaScript in the page and print the result as JSON.
+
+JS can be an expression, which may use await, or statements that end with a
+return. Page Content Security Policy doesn't apply.
+
+Examples:
+  rexweb eval document.title
+  rexweb eval 'await fetch("/api/health").then(r => r.status)'
+  rexweb eval 'const n = document.links.length; return n'
+
+Usage:
+  rexweb eval JS [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
+    wait) cat <<'EOF'
+Wait for an element, some text, or the page to finish loading.
+
+Examples:
+  rexweb wait --selector '#app .ready'
+  rexweb wait --text 'Deployed' --timeout 60
+
+Usage:
+  rexweb wait [flags]
+
+Options:
+  -b, --block BLOCK       act on BLOCK (defaults to the most recently used browser pane)
+      --selector SELECTOR wait until SELECTOR matches an element
+      --text TEXT         wait until the page's text contains TEXT
+      --timeout SECONDS   give up after SECONDS (default 15)
+EOF
+    ;;
+    screenshot|shot) cat <<'EOF'
+Save a PNG of the page and print its path.
+
+Usage:
+  rexweb screenshot [PATH] [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
+    cookies) cat <<'EOF'
+Import cookies into rexweb's browser profile, which every browser pane shares.
+
+Sites that sign in with a passkey or security key can't do that in rexweb: macOS
+only offers passkeys to browsers Apple has approved. Sign in with Chrome
+instead, then import the sign-in. The first import asks for the "Chrome Safe
+Storage" key in your Keychain.
+
+Commands:
+  import      Import cookies from your Chrome profile
+  set FILE    Import cookies from a JSON file of {name, value, domain, path, secure, expires}
+
+Examples:
+  rexweb cookies import --domain example.com --domain idp.example.com
+  rexweb cookies import --reload
+  rexweb cookies set cookies.json
+
+Usage:
+  rexweb cookies import [flags]
+  rexweb cookies set FILE
+
+Options:
+      --domain DOMAIN   import only cookies for DOMAIN and its subdomains (repeatable; default all)
+      --profile NAME    read Chrome profile NAME, such as "Profile 1" (default the most recently used)
+      --reload          reload every browser pane afterward
+EOF
+    ;;
+    *) help_root ;;
+  esac
+}
+
+# ---------------------------------------------------------------- helpers
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+api() {
+  local path="$1" body="${2:-{\}}" timeout="${3:-30}" out code
+  out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
+    -H 'content-type: application/json' -d "$body")" || die "rexweb isn't running. Open a pane with \"rexweb open\" to start it."
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  if [ "$code" -ge 400 ]; then die "$(jq -r '.error // .' <<<"$out" 2>/dev/null || echo "$out")"; fi
+  printf '%s\n' "$out"
+}
+
+pane_bin() {
+  for c in "$self/rexweb-pane" "$HOME/Applications/RexWeb.app/Contents/Resources/rexweb-pane"; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  die "rexweb-pane not found. Reinstall rexweb."
+}
+
+# Parse the shared flags: -b BLOCK, --json, -h. Everything else lands in $rest.
+block="" json=0 rest=()
+parse() {
+  rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b|--block) [ $# -ge 2 ] || die "flag needs an argument: $1"; block="$2"; shift 2 ;;
+      --block=*) block="${1#*=}"; shift ;;
+      --json) json=1; shift ;;
+      -h|--help) help_cmd "$cmd"; exit 0 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+}
+
+target() { jq -nc --arg id "$block" '{id:$id}'; }
+
+pane_line() { jq -r '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)"'; }
+
+print_info() { if [ "$json" = 1 ]; then jq .; else pane_line; fi; }
+
+# ---------------------------------------------------------------- commands
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  help|-h|--help)
+    if [ $# -gt 0 ]; then help_cmd "$1"; else help_root; fi ;;
+
+  open|new)
+    cmd=open
+    url="" split="right" ratio="" anchor="${REX_BLOCK:-}" session="${REX_SESSION:-}" tab=0 focus=true
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --split) split="$2"; shift 2 ;;
+        --split=*) split="${1#*=}"; shift ;;
+        --ratio) ratio="$2"; shift 2 ;;
+        --ratio=*) ratio="${1#*=}"; shift ;;
+        -b|--block) anchor="$2"; shift 2 ;;
+        -s|--session) session="$2"; shift 2 ;;
+        --tab) tab=1; shift ;;
+        --focus) focus=true; shift ;;
+        --focus=*) focus="${1#*=}"; shift ;;
+        --json) json=1; shift ;;
+        -h|--help) help_cmd open; exit 0 ;;
+        -*) die "unknown flag: $1" ;;
+        *) url="$1"; shift ;;
+      esac
+    done
+    case "$split" in right|left|above|below) ;; *) die "invalid --split \"$split\": use right, left, above, or below" ;; esac
+    case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
+    pb="$(pane_bin)"
+    opts=(--shell=none --label browser --json --focus="$focus")
+    [ -n "$session" ] && opts+=(-s "$session")
+    if [ "$tab" = 1 ]; then
+      res="$(rex run "${opts[@]}" -- env REXWEB_FOCUS="$focus" "$pb" "$url")"
+    else
+      opts+=(--split="$split")
+      [ -n "$ratio" ] && opts+=(--ratio "$ratio")
+      [ -n "$anchor" ] && opts+=(-b "$anchor")
+      res="$(rex split "${opts[@]}" -- env REXWEB_FOCUS="$focus" "$pb" "$url")"
+    fi
+    id="$(jq -r '.block_ids[0]' <<<"$res")"
+    # The pane starts RexWeb if it isn't running, then registers with it.
+    for _ in $(seq 1 80); do
+      if info="$(curl -s -m 1 -X POST "http://127.0.0.1:$port/info" -d "$(jq -nc --arg id "$id" '{id:$id}')")" &&
+         jq -e --arg id "$id" '.id == $id' >/dev/null 2>&1 <<<"$info"; then
+        if [ "$json" = 1 ]; then jq . <<<"$info"; else echo "$id"; fi
+        exit 0
+      fi
+      sleep 0.1
+    done
+    die "opened pane $id, but rexweb didn't pick it up. Check \"rexweb ls\"."
+    ;;
+
+  ls|list)
+    parse "$@"
+    out="$(api /list)"
+    if [ "$json" = 1 ]; then jq . <<<"$out"; else jq -c '.panels[]' <<<"$out" | while read -r p; do pane_line <<<"$p"; done; fi
+    ;;
+
+  info|focus|back|forward|reload)
+    parse "$@"
+    api "/$cmd" "$(target)" 60 | print_info
+    ;;
+
+  close)
+    parse "$@"
+    id="$(api /info "$(target)" | jq -r .id)"
+    rex block close "$id" >/dev/null 2>&1 || api /close "$(jq -nc --arg id "$id" '{id:$id}')" >/dev/null
+    [ "$json" = 1 ] && jq -nc --arg id "$id" '{closed:$id}' || echo "$id"
+    ;;
+
+  nav|go)
+    cmd=nav; parse "$@"
+    [ ${#rest[@]} -ge 1 ] || die "nav needs a URL. Run \"rexweb nav --help\"."
+    api /nav "$(jq -nc --arg id "$block" --arg u "${rest[0]}" '{id:$id, url:$u}')" 60 | print_info
+    ;;
+
+  snapshot|snap)
+    cmd=snapshot; parse "$@"
+    out="$(api /snapshot "$(target)")"
+    if [ "$json" = 1 ]; then jq . <<<"$out"
+    else jq -r '"\(.title)\n\(.url)\n\nElements:\n\(.elements)\n\nText:\n\(.text)"' <<<"$out"; fi
+    ;;
+
+  click)
+    parse "$@"
+    [ ${#rest[@]} -ge 1 ] || die "click needs a TARGET. Run \"rexweb click --help\"."
+    api /click "$(jq -nc --arg id "$block" --arg t "${rest[0]}" '{id:$id, target:$t}')" | print_info
+    ;;
+
+  type|fill)
+    cmd=type; parse "$@"
+    clear=false submit=false words=()
+    for a in "${rest[@]}"; do
+      case "$a" in --clear) clear=true ;; --submit) submit=true ;; *) words+=("$a") ;; esac
+    done
+    [ ${#words[@]} -ge 2 ] || die "type needs a TARGET and TEXT. Run \"rexweb type --help\"."
+    t="${words[0]}"; [ "$t" = "-" ] && t=""
+    api /type "$(jq -nc --arg id "$block" --arg t "$t" --arg x "${words[1]}" --argjson c "$clear" --argjson s "$submit" \
+      '{id:$id, target:$t, text:$x, clear:$c, submit:$s}')" | print_info
+    ;;
+
+  press|key)
+    cmd=press; parse "$@"
+    [ ${#rest[@]} -ge 1 ] || die "press needs a KEY. Run \"rexweb press --help\"."
+    api /press "$(jq -nc --arg id "$block" --arg k "${rest[0]}" '{id:$id, key:$k}')" >/dev/null
+    ;;
+
+  eval|js)
+    cmd=eval; parse "$@"
+    [ ${#rest[@]} -ge 1 ] || die "eval needs JS. Run \"rexweb eval --help\"."
+    api /eval "$(jq -nc --arg id "$block" --arg j "${rest[*]}" '{id:$id, js:$j}')" 60 | jq '.value'
+    ;;
+
+  wait)
+    parse "$@"
+    sel="" text="" timeout=15
+    set -- ${rest[@]+"${rest[@]}"}
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --selector) sel="$2"; shift 2 ;;
+        --text) text="$2"; shift 2 ;;
+        --timeout) timeout="$2"; shift 2 ;;
+        *) die "unknown argument: $1" ;;
+      esac
+    done
+    api /wait "$(jq -nc --arg id "$block" --arg s "$sel" --arg t "$text" --argjson to "$timeout" \
+      '{id:$id, selector:$s, text:$t, timeout:$to}')" $((timeout + 5)) | print_info
+    ;;
+
+  screenshot|shot)
+    cmd=screenshot; parse "$@"
+    body="$(target)"
+    if [ ${#rest[@]} -ge 1 ]; then
+      dir="$(cd "$(dirname "${rest[0]}")" && pwd -P)" || die "no such directory: $(dirname "${rest[0]}")"
+      body="$(jq -nc --arg id "$block" --arg p "$dir/$(basename "${rest[0]}")" '{id:$id, path:$p}')"
+    fi
+    api /shot "$body" | jq -r .path
+    ;;
+
+  cookies)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      import)
+        domains=() profile="" reload=false
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --domain) domains+=("$2"); shift 2 ;;
+            --domain=*) domains+=("${1#*=}"); shift ;;
+            --profile) profile="$2"; shift 2 ;;
+            --reload) reload=true; shift ;;
+            --json) json=1; shift ;;
+            -h|--help) help_cmd cookies; exit 0 ;;
+            *) die "unknown argument: $1" ;;
+          esac
+        done
+        curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 || {
+          open -g "$HOME/Applications/RexWeb.app" 2>/dev/null || open -g -a RexWeb
+          for _ in $(seq 1 50); do curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 0.1; done
+        }
+        body="$(jq -nc --arg p "$profile" --argjson r "$reload" '{profile:(if $p == "" then null else $p end), reload:$r, domains:$ARGS.positional}' \
+          --args ${domains[@]+"${domains[@]}"})"
+        out="$(api /cookies/import "$body" 180)"
+        if [ "$json" = 1 ]; then jq . <<<"$out"
+        else jq -r '"Imported \(.imported) cookies from Chrome" + (if .skipped > 0 then " (\(.skipped) couldn'"'"'t be decrypted)" else "" end) + "."' <<<"$out"; fi
+        ;;
+      set)
+        [ $# -ge 1 ] || die "cookies set needs a FILE. Run \"rexweb cookies --help\"."
+        api /cookies "$(jq -c '{cookies:.}' "$1")" | jq -r '"Imported \(.set) cookies."'
+        ;;
+      ""|-h|--help|help) help_cmd cookies ;;
+      *) die "unknown cookies command \"$sub\". Run \"rexweb cookies --help\"." ;;
+    esac
+    ;;
+
+  *)
+    echo "Error: unknown command \"$cmd\" for \"rexweb\"" >&2
+    echo "Run 'rexweb --help' for usage." >&2
+    exit 1
+    ;;
+esac

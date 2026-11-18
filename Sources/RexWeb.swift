@@ -1,0 +1,1035 @@
+import AppKit
+import CommonCrypto
+import SQLite3
+import CoreGraphics
+import Network
+import WebKit
+
+struct Config {
+  var top = 46.0, left = 8.0, right = 8.0, bottom = 8.0
+  var gap = 8.0, header = 36.0, radius = 10.0
+  var port = 18802
+  var searchURL = "https://www.google.com/search?q=%s"
+  var rexBin = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
+
+  static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
+
+  static func load() -> Config {
+    var c = Config()
+    if let bin = ProcessInfo.processInfo.environment["REX_BIN"], !bin.isEmpty { c.rexBin = bin }
+    let url = dir.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: url),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return c }
+    func d(_ k: String, _ v: inout Double) { if let n = o[k] as? NSNumber { v = n.doubleValue } }
+    d("top", &c.top); d("left", &c.left); d("right", &c.right); d("bottom", &c.bottom)
+    d("gap", &c.gap); d("header", &c.header); d("radius", &c.radius)
+    if let p = o["port"] as? NSNumber { c.port = p.intValue }
+    if let b = o["rex_bin"] as? String { c.rexBin = b }
+    if let u = o["search_url"] as? String, u.contains("%s") { c.searchURL = u }
+    return c
+  }
+}
+
+var config = Config.load()
+
+func log(_ s: String) {
+  FileHandle.standardError.write(("[rexweb] " + s + "\n").data(using: .utf8)!)
+}
+
+enum Rex {
+  static let queue = DispatchQueue(label: "rexweb.rex", attributes: .concurrent)
+
+  @discardableResult
+  static func run(_ args: [String]) -> Data? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: config.rexBin)
+    p.arguments = args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { log("rex failed: \(error)"); return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return p.terminationStatus == 0 ? data : nil
+  }
+
+  static func view(_ session: String) -> [String: Any]? {
+    let args = String(data: try! JSONSerialization.data(withJSONObject: ["session_id": session]), encoding: .utf8)!
+    guard let data = run(["api", "call", "session.view", args]) else { return nil }
+    return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+  }
+
+  static func async(_ args: [String]) { queue.async { run(args) } }
+
+  static let labelQueue = DispatchQueue(label: "rexweb.label")
+  static var pendingLabels: [String: (String, String)] = [:]
+  static let labelLock = NSLock()
+
+  static func setLabel(block: String, session: String, _ label: String) {
+    labelLock.lock(); pendingLabels[block] = (session, label); labelLock.unlock()
+    labelQueue.async {
+      labelLock.lock(); let next = pendingLabels.removeValue(forKey: block); labelLock.unlock()
+      guard let (session, label) = next else { return }
+      run(["block", "rename", "-s", session, block, label])
+    }
+  }
+}
+
+final class OverlayWindow: NSWindow {
+  override var canBecomeKey: Bool { true }
+  override var canBecomeMain: Bool { true }
+}
+
+final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
+  let id: String
+  let session: String
+  let window: OverlayWindow
+  let web: WKWebView
+  let bar = NSView()
+  let urlField = NSTextField()
+  let backButton = NSButton()
+  let forwardButton = NSButton()
+  let reloadButton = NSButton()
+  var loadWaiters: [(String?) -> Void] = []
+  var lastLabel = ""
+  var visible = false
+  var lastFrame = NSRect.zero
+  var lastActive = Date()
+  var focusedInRex = false
+
+  static let barHeight: CGFloat = 30
+  static let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "6F1C0D2A-9C3B-4E55-9B7A-5E3B0AEB0001")!)
+
+  init(id: String, session: String) {
+    self.id = id
+    self.session = session
+    let conf = WKWebViewConfiguration()
+    conf.websiteDataStore = Panel.store
+    conf.applicationNameForUserAgent = "Version/26.4 Safari/605.1.15"
+    conf.preferences.isElementFullscreenEnabled = true
+    conf.allowsAirPlayForMediaPlayback = true
+    web = WKWebView(frame: .zero, configuration: conf)
+    window = OverlayWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                           styleMask: [.borderless], backing: .buffered, defer: false)
+    super.init()
+
+    window.isReleasedWhenClosed = false
+    window.hasShadow = false
+    window.backgroundColor = .clear
+    window.isOpaque = false
+    window.collectionBehavior = [.managed, .fullScreenAuxiliary]
+
+    let root = NSView()
+    root.wantsLayer = true
+    root.layer?.cornerRadius = config.radius
+    root.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+    root.layer?.masksToBounds = true
+    root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+    window.contentView = root
+
+    web.navigationDelegate = self
+    web.uiDelegate = self
+    web.isInspectable = true
+    web.allowsBackForwardNavigationGestures = true
+    web.allowsMagnification = true
+
+    for (b, sym, tip, sel) in [(backButton, "chevron.left", "Back", #selector(goBack)),
+                               (forwardButton, "chevron.right", "Forward", #selector(goForward)),
+                               (reloadButton, "arrow.clockwise", "Reload", #selector(reload))] {
+      b.image = NSImage(systemSymbolName: sym, accessibilityDescription: tip)
+      b.bezelStyle = .accessoryBarAction
+      b.isBordered = false
+      b.toolTip = tip
+      b.target = self
+      b.action = sel
+      bar.addSubview(b)
+    }
+    urlField.placeholderString = "Search or enter address"
+    urlField.font = .systemFont(ofSize: 12)
+    urlField.bezelStyle = .roundedBezel
+    urlField.focusRingType = .none
+    urlField.lineBreakMode = .byTruncatingTail
+    urlField.usesSingleLineMode = true
+    urlField.delegate = self
+    urlField.target = self
+    urlField.action = #selector(submitURL)
+    bar.addSubview(urlField)
+
+    root.addSubview(bar)
+    root.addSubview(web)
+    layout()
+    NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
+      self?.layout()
+    }
+    NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+      guard let self else { return }
+      self.lastActive = Date()
+      Rex.async(["focus", "-s", self.session, self.id])
+    }
+    web.addObserver(self, forKeyPath: "title", options: .new, context: nil)
+    web.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
+    web.addObserver(self, forKeyPath: "canGoBack", options: .new, context: nil)
+    web.addObserver(self, forKeyPath: "canGoForward", options: .new, context: nil)
+    updateChrome()
+  }
+
+  func layout() {
+    guard let root = window.contentView else { return }
+    let b = root.bounds
+    let h = Panel.barHeight
+    bar.frame = NSRect(x: 0, y: b.height - h, width: b.width, height: h)
+    backButton.frame = NSRect(x: 6, y: 4, width: 24, height: 22)
+    forwardButton.frame = NSRect(x: 30, y: 4, width: 24, height: 22)
+    reloadButton.frame = NSRect(x: 54, y: 4, width: 24, height: 22)
+    urlField.frame = NSRect(x: 84, y: 4, width: max(40, b.width - 92), height: 22)
+    web.frame = NSRect(x: 0, y: 0, width: b.width, height: max(0, b.height - h))
+  }
+
+  override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
+    updateChrome()
+  }
+
+  func updateChrome() {
+    backButton.isEnabled = web.canGoBack
+    forwardButton.isEnabled = web.canGoForward
+    if window.firstResponder != urlField.currentEditor() {
+      urlField.stringValue = web.url?.absoluteString ?? ""
+    }
+    guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
+    let label = String(title.prefix(80))
+    if label != lastLabel {
+      lastLabel = label
+      Rex.setLabel(block: id, session: session, label)
+    }
+  }
+
+  func info() -> [String: Any] {
+    ["id": id, "session": session, "url": web.url?.absoluteString ?? "", "title": web.title ?? "",
+     "loading": web.isLoading, "visible": visible]
+  }
+
+  static func normalize(_ raw: String) -> URL? {
+    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if s.isEmpty { return nil }
+    if s.contains("://") || s.hasPrefix("about:") || s.hasPrefix("data:") { return URL(string: s) }
+    if s.hasPrefix("localhost") || s.hasPrefix("127.") || s.hasPrefix("[::1]") || s.range(of: #"^\d+$"#, options: .regularExpression) != nil {
+      let hostPort = s.range(of: #"^\d+$"#, options: .regularExpression) != nil ? "localhost:\(s)" : s
+      return URL(string: "http://" + hostPort)
+    }
+    if !s.contains(" ") && s.contains(".") { return URL(string: "https://" + s) }
+    let q = s.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&+=?#"))) ?? s
+    return URL(string: config.searchURL.replacingOccurrences(of: "%s", with: q))
+  }
+
+  func load(_ raw: String, done: ((String?) -> Void)? = nil) {
+    guard let url = Panel.normalize(raw) else { done?("bad url"); return }
+    if let done { loadWaiters.append(done) }
+    if url.isFileURL {
+      web.loadFileURL(url, allowingReadAccessTo: URL(fileURLWithPath: "/"))
+    } else {
+      web.load(URLRequest(url: url))
+    }
+  }
+
+  func waitForLoad(_ done: @escaping (String?) -> Void) {
+    if !web.isLoading { done(nil); return }
+    loadWaiters.append(done)
+  }
+
+  func finishWaiters(_ err: String?) {
+    let w = loadWaiters
+    loadWaiters = []
+    w.forEach { $0(err) }
+  }
+
+  @objc func goBack() { web.goBack() }
+  @objc func goForward() { web.goForward() }
+  @objc func reload() { web.reload() }
+  @objc func submitURL() {
+    load(urlField.stringValue)
+    window.makeFirstResponder(web)
+  }
+
+  func focusURL() {
+    window.makeFirstResponder(urlField)
+    urlField.currentEditor()?.selectAll(nil)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { finishWaiters(nil); updateChrome() }
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finishWaiters(error.localizedDescription) }
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    finishWaiters(error.localizedDescription)
+  }
+
+  var popups: [Popup] = []
+
+  func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+               for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+    let isPopup = windowFeatures.width != nil || windowFeatures.height != nil || navigationAction.navigationType == .other
+    if !isPopup {
+      if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
+      return nil
+    }
+    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window)
+    popup.onClose = { [weak self, weak popup] in self?.popups.removeAll { $0 === popup } }
+    popups.append(popup)
+    return popup.web
+  }
+
+  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+               decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
+       navigationAction.navigationType == .linkActivated {
+      App.shared.openPane(beside: id, session: session, url: url.absoluteString)
+      decisionHandler(.cancel)
+      return
+    }
+    decisionHandler(.allow)
+  }
+
+  func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+    let a = NSAlert(); a.messageText = message; a.beginSheetModal(for: window) { _ in completionHandler() }
+  }
+
+  func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+    let a = NSAlert(); a.messageText = message; a.addButton(withTitle: "OK"); a.addButton(withTitle: "Cancel")
+    a.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
+  }
+
+  func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+    let p = NSOpenPanel(); p.allowsMultipleSelection = parameters.allowsMultipleSelection
+    p.canChooseDirectories = parameters.allowsDirectories
+    p.beginSheetModal(for: window) { completionHandler($0 == .OK ? p.urls : nil) }
+  }
+
+  func close() {
+    popups.forEach { $0.window.close() }
+    popups = []
+    finishWaiters("closed")
+    for k in ["title", "URL", "canGoBack", "canGoForward"] { web.removeObserver(self, forKeyPath: k) }
+    window.orderOut(nil)
+    window.close()
+  }
+}
+
+final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegate {
+  let web: WKWebView
+  let window: NSWindow
+  var onClose: (() -> Void)?
+
+  init(configuration: WKWebViewConfiguration, features: WKWindowFeatures, parent: NSWindow) {
+    let w = CGFloat(features.width?.doubleValue ?? 520), h = CGFloat(features.height?.doubleValue ?? 680)
+    web = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
+    window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
+                      styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+    super.init()
+    window.isReleasedWhenClosed = false
+    window.contentView = web
+    window.delegate = self
+    web.uiDelegate = self
+    web.navigationDelegate = self
+    web.isInspectable = true
+    let pf = parent.frame
+    window.setFrameOrigin(NSPoint(x: pf.midX - w / 2, y: pf.midY - h / 2))
+    window.level = .floating
+    window.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  func webViewDidClose(_ webView: WKWebView) { window.close() }
+  func windowWillClose(_ n: Notification) { onClose?() }
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { window.title = webView.title ?? "" }
+}
+
+enum ChromeCookies {
+  static let root = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/Google/Chrome")
+
+  static func database(profile: String?) throws -> URL {
+    let fm = FileManager.default
+    let profiles = profile.map { [$0] } ?? ((try? fm.contentsOfDirectory(atPath: root.path)) ?? [])
+    var found: [(URL, Date)] = []
+    for p in profiles {
+      for name in ["Network/Cookies", "Cookies"] {
+        let u = root.appendingPathComponent(p).appendingPathComponent(name)
+        if let a = try? fm.attributesOfItem(atPath: u.path), let d = a[.modificationDate] as? Date { found.append((u, d)) }
+      }
+    }
+    guard let newest = found.max(by: { $0.1 < $1.1 }) else {
+      throw NSError(domain: "rexweb", code: 1, userInfo: [NSLocalizedDescriptionKey: "no Chrome cookies database found"])
+    }
+    return newest.0
+  }
+
+  static func key() throws -> Data {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-a", "Chrome", "-s", "Chrome Safe Storage", "-w"]
+    let out = Pipe(); p.standardOutput = out; p.standardError = FileHandle.nullDevice
+    try p.run(); p.waitUntilExit()
+    let secret = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard p.terminationStatus == 0, !secret.isEmpty else {
+      throw NSError(domain: "rexweb", code: 2, userInfo: [NSLocalizedDescriptionKey: "couldn't read Chrome Safe Storage from the Keychain"])
+    }
+    var derived = Data(count: 16)
+    let salt = Array("saltysalt".utf8)
+    _ = derived.withUnsafeMutableBytes { d in
+      CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), secret, secret.utf8.count, salt, salt.count,
+                           CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), 1003, d.bindMemory(to: UInt8.self).baseAddress, 16)
+    }
+    return derived
+  }
+
+  static func decrypt(_ blob: Data, key: Data, integrityPrefix: Bool) -> String? {
+    guard blob.count > 3, let tag = String(data: blob.prefix(3), encoding: .ascii), tag == "v10" || tag == "v20" else { return nil }
+    let cipher = blob.dropFirst(3)
+    var out = Data(count: cipher.count + kCCBlockSizeAES128)
+    var moved = 0
+    let iv = [UInt8](repeating: 0x20, count: 16)
+    let outCount = out.count
+    let status = out.withUnsafeMutableBytes { o in
+      cipher.withUnsafeBytes { c in
+        key.withUnsafeBytes { k in
+          CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
+                  k.baseAddress, key.count, iv, c.baseAddress, cipher.count, o.baseAddress, outCount, &moved)
+        }
+      }
+    }
+    guard status == kCCSuccess else { return nil }
+    var plain = out.prefix(moved)
+    if integrityPrefix { plain = plain.dropFirst(32) }
+    return String(data: plain, encoding: .utf8)
+  }
+
+  static func read(profile: String?, domains: [String]) throws -> (cookies: [HTTPCookie], skipped: Int) {
+    let src = try database(profile: profile)
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("rexweb-cookies-\(UUID().uuidString)")
+    try FileManager.default.copyItem(at: src, to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    var db: OpaquePointer?
+    guard sqlite3_open_v2(tmp.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+      throw NSError(domain: "rexweb", code: 3, userInfo: [NSLocalizedDescriptionKey: "couldn't open Chrome's cookies database"])
+    }
+    defer { sqlite3_close(db) }
+    func query(_ sql: String, _ row: (OpaquePointer) -> Void) {
+      var st: OpaquePointer?
+      guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else { return }
+      while sqlite3_step(st) == SQLITE_ROW { row(st) }
+      sqlite3_finalize(st)
+    }
+    var version = 0
+    query("SELECT value FROM meta WHERE key = 'version'") { version = Int(String(cString: sqlite3_column_text($0, 0))) ?? 0 }
+    let k = try key()
+    let now = Date()
+    var cookies: [HTTPCookie] = []
+    var skipped = 0
+    let wanted = domains.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+    query("SELECT host_key, name, path, is_secure, is_httponly, expires_utc, encrypted_value, samesite FROM cookies") { st in
+      let host = String(cString: sqlite3_column_text(st, 0))
+      let bare = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+      if !wanted.isEmpty && !wanted.contains(where: { bare == $0 || bare.hasSuffix("." + $0) }) { return }
+      let len = Int(sqlite3_column_bytes(st, 6))
+      guard len > 0, let ptr = sqlite3_column_blob(st, 6) else { return }
+      guard let value = decrypt(Data(bytes: ptr, count: len), key: k, integrityPrefix: version >= 24) else { skipped += 1; return }
+      let expiresUTC = sqlite3_column_int64(st, 5)
+      var props: [HTTPCookiePropertyKey: Any] = [
+        .domain: host, .name: String(cString: sqlite3_column_text(st, 1)), .value: value,
+        .path: { let p = String(cString: sqlite3_column_text(st, 2)); return p.isEmpty ? "/" : p }(),
+      ]
+      if expiresUTC > 0 {
+        let expires = Date(timeIntervalSince1970: Double(expiresUTC - 11_644_473_600_000_000) / 1e6)
+        if expires < now { return }
+        props[.expires] = expires
+      }
+      if sqlite3_column_int(st, 3) == 1 { props[.secure] = "TRUE" }
+      if sqlite3_column_int(st, 4) == 1 { props[HTTPCookiePropertyKey("HttpOnly")] = "TRUE" }
+      switch sqlite3_column_int(st, 7) {
+      case 0: props[.sameSitePolicy] = "none"
+      case 1: props[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteLax.rawValue
+      case 2: props[.sameSitePolicy] = HTTPCookieStringPolicy.sameSiteStrict.rawValue
+      default: break
+      }
+      if let c = HTTPCookie(properties: props) { cookies.append(c) }
+    }
+    return (cookies, skipped)
+  }
+}
+
+struct RexWindow { let number: Int; let name: String; let bounds: CGRect }
+
+final class Tracker {
+  var views: [String: [String: Any]] = [:]
+  var refreshing = Set<String>()
+  var dirty = Set<String>()
+  var eventsProcess: Process?
+  var rexWasActive = false
+
+  func start() {
+    Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
+    startEvents()
+  }
+
+  func startEvents() {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: config.rexBin)
+    p.arguments = ["events", "--all", "--json"]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    out.fileHandleForReading.readabilityHandler = { [weak self] h in
+      let d = h.availableData
+      if d.isEmpty { return }
+      DispatchQueue.main.async { self?.refreshAll() }
+    }
+    p.terminationHandler = { [weak self] _ in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.startEvents() }
+    }
+    do { try p.run(); eventsProcess = p } catch { log("events failed: \(error)") }
+  }
+
+  func refreshAll() {
+    for s in Set(App.shared.panels.values.map(\.session)) { refresh(s) }
+  }
+
+  func refresh(_ session: String) {
+    if refreshing.contains(session) { dirty.insert(session); return }
+    refreshing.insert(session)
+    Rex.queue.async {
+      let v = Rex.view(session)
+      DispatchQueue.main.async {
+        self.refreshing.remove(session)
+        if let v { self.views[session] = v; self.reconcile(session) }
+        if self.dirty.remove(session) != nil { self.refresh(session) }
+      }
+    }
+  }
+
+  func reconcile(_ session: String) {
+    guard let v = views[session] else { return }
+    let ids = Set(Tracker.allBlockIDs(v))
+    for p in App.shared.panels.values where p.session == session && !ids.contains(p.id) {
+      App.shared.closePanel(p.id)
+    }
+  }
+
+  static func allBlockIDs(_ v: [String: Any]) -> [String] {
+    var out: [String] = []
+    for w in v["windows"] as? [[String: Any]] ?? [] {
+      for l in w["layers"] as? [[String: Any]] ?? [] {
+        for b in l["blocks"] as? [[String: Any]] ?? [] { if let id = b["block_id"] as? String { out.append(id) } }
+      }
+    }
+    return out
+  }
+
+  static func rexWindows() -> (rex: [RexWindow], order: [Int]) {
+    let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+    var rex: [RexWindow] = []
+    var order: [Int] = []
+    for w in list {
+      guard let n = w[kCGWindowNumber as String] as? Int else { continue }
+      order.append(n)
+      let owner = w[kCGWindowOwnerName as String] as? String ?? ""
+      let layer = w[kCGWindowLayer as String] as? Int ?? 0
+      guard layer == 0, owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
+      guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
+            let r = CGRect(dictionaryRepresentation: bd), r.width > 200 else { continue }
+      rex.append(RexWindow(number: n, name: w[kCGWindowName as String] as? String ?? "", bounds: r))
+    }
+    return (rex, order)
+  }
+
+  static func placement(of id: String, in view: [String: Any]) -> CGRect? {
+    guard let active = view["active_window_id"] as? String,
+          let windows = view["windows"] as? [[String: Any]],
+          let win = windows.first(where: { w in
+            (w["layers"] as? [[String: Any]] ?? []).contains { l in
+              (l["blocks"] as? [[String: Any]] ?? []).contains { $0["block_id"] as? String == id }
+            }
+          }),
+          win["window_id"] as? String == active else { return nil }
+    if let z = win["zoomed_block_id"] as? String, !z.isEmpty {
+      return z == id ? CGRect(x: 0, y: 0, width: 1, height: 1) : nil
+    }
+    for l in win["layers"] as? [[String: Any]] ?? [] {
+      let lb = rect(l["bounds"]) ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+      if let r = find(id, in: l["layout"]) {
+        if l["kind"] as? String == "tiled" { return r }
+        if (l["state"] as? String) == "minimized" { return nil }
+        return CGRect(x: lb.minX + r.minX * lb.width, y: lb.minY + r.minY * lb.height,
+                      width: r.width * lb.width, height: r.height * lb.height)
+      }
+    }
+    return nil
+  }
+
+  static func rect(_ any: Any?) -> CGRect? {
+    guard let a = any as? [NSNumber], a.count == 4 else { return nil }
+    return CGRect(x: a[0].doubleValue, y: a[1].doubleValue, width: a[2].doubleValue, height: a[3].doubleValue)
+  }
+
+  static func find(_ id: String, in node: Any?) -> CGRect? {
+    if let d = node as? [String: Any] {
+      if d["block_id"] as? String == id { return rect(d["rect"]) }
+      for (_, v) in d { if let r = find(id, in: v) { return r } }
+    } else if let a = node as? [Any] {
+      for v in a { if let r = find(id, in: v) { return r } }
+    }
+    return nil
+  }
+
+  static func focused(in view: [String: Any]) -> String? {
+    guard let active = view["active_window_id"] as? String,
+          let w = (view["windows"] as? [[String: Any]])?.first(where: { $0["window_id"] as? String == active }) else { return nil }
+    return w["focused_block_id"] as? String
+  }
+
+  func tick() {
+    let panels = App.shared.panels.values
+    if panels.isEmpty { return }
+    let (rexWins, order) = Tracker.rexWindows()
+    let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
+    let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+
+    for p in panels {
+      guard let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
+      let label = v["label"] as? String ?? ""
+      guard let rw = rexWins.first(where: { $0.name == "Rex - \(label)" || $0.name == label })
+              ?? (rexWins.count == 1 ? rexWins[0] : nil) else { hide(p); continue }
+
+      let b = rw.bounds
+      let area = CGRect(x: b.minX + config.left, y: b.minY + config.top,
+                        width: b.width - config.left - config.right, height: b.height - config.top - config.bottom)
+      var card = CGRect(x: area.minX + frac.minX * area.width, y: area.minY + frac.minY * area.height,
+                        width: frac.width * area.width, height: frac.height * area.height)
+      let g = config.gap / 2, eps = 0.001
+      if frac.minX > eps { card.origin.x += g; card.size.width -= g }
+      if frac.maxX < 1 - eps { card.size.width -= g }
+      if frac.minY > eps { card.origin.y += g; card.size.height -= g }
+      if frac.maxY < 1 - eps { card.size.height -= g }
+      let body = CGRect(x: card.minX, y: card.minY + config.header, width: card.width, height: card.height - config.header)
+      guard body.width > 20, body.height > 20 else { hide(p); continue }
+      let ns = NSRect(x: body.minX, y: primaryHeight - body.maxY, width: body.width, height: body.height)
+      if ns != p.lastFrame { p.window.setFrame(ns, display: true); p.lastFrame = ns }
+
+      let mine = p.window.windowNumber
+      let iMine = order.firstIndex(of: mine), iRex = order.firstIndex(of: rw.number)
+      let ours = Set(App.shared.panels.values.map { $0.window.windowNumber })
+      var stacked = false
+      if let iMine, let iRex, iMine < iRex {
+        stacked = order[(iMine + 1)..<iRex].allSatisfy { ours.contains($0) }
+      }
+      if !p.visible || !stacked { p.window.order(.above, relativeTo: rw.number) }
+      p.visible = true
+
+      let isFocused = Tracker.focused(in: v) == p.id
+      if isFocused && !p.focusedInRex && rexActive {
+        App.shared.focus(p)
+      }
+      p.focusedInRex = isFocused
+    }
+    rexWasActive = rexActive
+  }
+
+  func hide(_ p: Panel) {
+    if p.visible { p.window.orderOut(nil); p.visible = false }
+  }
+}
+
+final class Server {
+  var listener: NWListener!
+
+  func start() {
+    do {
+      let params = NWParameters.tcp
+      params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(config.port))!)
+      params.allowLocalEndpointReuse = true
+      listener = try NWListener(using: params)
+    } catch { log("listen failed: \(error)"); exit(1) }
+    listener.newConnectionHandler = { conn in
+      conn.start(queue: .main)
+      self.read(conn, Data())
+    }
+    listener.stateUpdateHandler = { st in
+      if case .failed(let e) = st { log("listener failed: \(e)"); exit(1) }
+    }
+    listener.start(queue: .main)
+  }
+
+  func read(_ conn: NWConnection, _ sofar: Data) {
+    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 22) { data, _, done, _ in
+      var buf = sofar
+      if let data { buf.append(data) }
+      guard let split = buf.range(of: Data("\r\n\r\n".utf8)) else {
+        return done ? conn.cancel() : self.read(conn, buf)
+      }
+      let head = String(decoding: buf[..<split.lowerBound], as: UTF8.self)
+      let length = head.split(separator: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
+        .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
+      let body = buf[split.upperBound...]
+      if body.count < length && !done { return self.read(conn, buf) }
+      let path = head.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
+      let input = (try? JSONSerialization.jsonObject(with: Data(body))) as? [String: Any] ?? [:]
+      App.shared.handle(path: path, input: input) { status, out in
+        let bytes = (try? JSONSerialization.data(withJSONObject: out, options: [.fragmentsAllowed])) ?? Data("{}".utf8)
+        let top = "HTTP/1.1 \(status) X\r\ncontent-type: application/json\r\ncontent-length: \(bytes.count)\r\nconnection: close\r\n\r\n"
+        conn.send(content: Data(top.utf8) + bytes, completion: .contentProcessed { _ in conn.cancel() })
+      }
+    }
+  }
+}
+
+enum JS {
+  static let snapshot = #"""
+  const max = args.max || 400;
+  const sel = 'a[href],button,input,textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[role=menuitem],[role=option],[role=switch],[contenteditable=""],[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
+  const vis = el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  const name = el => (el.getAttribute('aria-label') || el.labels?.[0]?.innerText || el.innerText || el.value ||
+    el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || el.getAttribute('name') || '')
+    .replace(/\s+/g, ' ').trim().slice(0, 80);
+  document.querySelectorAll('[data-rexweb-ref]').forEach(e => e.removeAttribute('data-rexweb-ref'));
+  const lines = []; let n = 0;
+  for (const el of document.querySelectorAll(sel)) {
+    if (n >= max || !vis(el)) continue;
+    const ref = 'e' + (++n); el.setAttribute('data-rexweb-ref', ref);
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' ? (el.type || 'text') : tag);
+    let extra = '';
+    if (tag === 'a') extra = ' -> ' + el.getAttribute('href');
+    if ('checked' in el && (el.type === 'checkbox' || el.type === 'radio')) extra += el.checked ? ' [checked]' : ' [ ]';
+    if ((tag === 'input' || tag === 'textarea') && el.value && el.type !== 'password') extra += ' value=' + JSON.stringify(el.value.slice(0, 60));
+    if (el.disabled) extra += ' [disabled]';
+    lines.push(`[${ref}] ${role} "${name(el)}"${extra}`);
+  }
+  const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').slice(0, args.textMax || 6000);
+  return { url: location.href, title: document.title, elements: lines.join('\n'), text };
+  """#
+
+  static let resolve = #"""
+  const t = args.target;
+  const el = /^@?e\d+$/.test(t) ? document.querySelector(`[data-rexweb-ref="${t.replace('@','')}"]`) : document.querySelector(t);
+  if (!el) return { error: 'no element for ' + t + ' (run snapshot first for e-refs)' };
+  el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2, tag: el.tagName.toLowerCase() };
+  """#
+
+  static let fill = #"""
+  const t = args.target;
+  let el = t ? (/^@?e\d+$/.test(t) ? document.querySelector(`[data-rexweb-ref="${t.replace('@','')}"]`) : document.querySelector(t)) : document.activeElement;
+  if (!el) return { error: 'no element for ' + t };
+  el.focus();
+  if (el.isContentEditable) {
+    if (args.clear) { document.execCommand('selectAll'); document.execCommand('delete'); }
+    document.execCommand('insertText', false, args.text);
+  } else {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const set = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    set.call(el, (args.clear ? '' : el.value) + args.text);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (args.submit) {
+    const f = el.form; if (f) { f.requestSubmit ? f.requestSubmit() : f.submit(); }
+    else el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+  }
+  return { ok: true };
+  """#
+
+  static func evaluate(_ code: String, asExpression: Bool) -> String {
+    let body = asExpression ? "return (\n\(code)\n);" : code
+    return """
+    const __v = await (async () => { \(body) })();
+    try { return JSON.parse(JSON.stringify(__v === undefined ? null : __v)); } catch (e) { return String(__v); }
+    """
+  }
+
+  static let exists = #"""
+  if (args.selector) return !!document.querySelector(args.selector);
+  if (args.text) return (document.body?.innerText || '').includes(args.text);
+  return document.readyState === 'complete';
+  """#
+}
+
+final class App: NSObject, NSApplicationDelegate {
+  static let shared = App()
+  var panels: [String: Panel] = [:]
+  let tracker = Tracker()
+  let server = Server()
+
+  func applicationDidFinishLaunching(_ n: Notification) {
+    try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+    buildMenu()
+    server.start()
+    tracker.start()
+    NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.key(e) == true ? nil : e }
+    log("listening on 127.0.0.1:\(config.port)")
+  }
+
+  func buildMenu() {
+    let main = NSMenu()
+    let appItem = NSMenuItem(); main.addItem(appItem)
+    let appMenu = NSMenu(); appItem.submenu = appMenu
+    appMenu.addItem(withTitle: "Quit RexWeb", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    let editItem = NSMenuItem(); main.addItem(editItem)
+    let edit = NSMenu(title: "Edit"); editItem.submenu = edit
+    edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    NSApp.mainMenu = main
+  }
+
+  var keyPanel: Panel? { panels.values.first { $0.window.isKeyWindow } }
+
+  func key(_ e: NSEvent) -> Bool {
+    guard let p = keyPanel else { return false }
+    let m = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    let c = e.charactersIgnoringModifiers?.lowercased() ?? ""
+    if m == .command {
+      switch c {
+      case "l": p.focusURL(); return true
+      case "r": p.web.reload(); return true
+      case "[": p.web.goBack(); return true
+      case "]": p.web.goForward(); return true
+      case "=", "+": p.web.pageZoom = min(3, p.web.pageZoom + 0.1); return true
+      case "-": p.web.pageZoom = max(0.3, p.web.pageZoom - 0.1); return true
+      case "0": p.web.pageZoom = 1; return true
+      case "w": Rex.async(["block", "close", p.id]); return true
+      default: break
+      }
+    }
+    if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
+    if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
+      let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
+      if let dir { returnToRex(p, focus: dir); return true }
+    }
+    if m == [.control, .option], c == "`" { returnToRex(p, focus: nil); return true }
+    return false
+  }
+
+  func returnToRex(_ p: Panel, focus dir: String?) {
+    p.focusedInRex = true
+    activateRex()
+    if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir]) }
+  }
+
+  func activateRex() {
+    _ = NSRunningApplication.runningApplications(withBundleIdentifier: "com.superlogical.rex").first?.activate()
+      ?? NSWorkspace.shared.runningApplications.first { $0.localizedName?.hasPrefix("Rex") == true && $0.activationPolicy == .regular }?.activate()
+  }
+
+  func focus(_ p: Panel) {
+    p.lastActive = Date()
+    NSApp.activate(ignoringOtherApps: true)
+    p.window.makeKeyAndOrderFront(nil)
+    p.window.makeFirstResponder(p.web)
+  }
+
+  func closePanel(_ id: String) {
+    guard let p = panels.removeValue(forKey: id) else { return }
+    p.close()
+  }
+
+  func openPane(beside id: String, session: String, url: String) {
+    let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
+    Rex.async(["split", "-s", session, "-b", id, "--split=right", "--shell=none", "--", pane, url])
+  }
+
+  func resolve(_ raw: Any?) -> Panel? {
+    let s = (raw as? String) ?? ""
+    if s.isEmpty { return panels.values.max { $0.lastActive < $1.lastActive } }
+    if let p = panels[s] { return p }
+    let m = panels.values.filter { $0.id.hasSuffix(s) || $0.lastLabel.localizedCaseInsensitiveContains(s) }
+    return m.count == 1 ? m[0] : nil
+  }
+
+  func js(_ p: Panel, _ body: String, _ args: [String: Any], _ done: @escaping (Any?, String?) -> Void) {
+    p.web.callAsyncJavaScript(body, arguments: ["args": args], in: nil, in: .page) { r in
+      switch r {
+      case .success(let v): done(v, nil)
+      case .failure(let e): done(nil, (e as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? e.localizedDescription)
+      }
+    }
+  }
+
+  func handle(path: String, input: [String: Any], reply: @escaping (Int, Any) -> Void) {
+    let ok = { (v: Any) in reply(200, v) }
+    let fail = { (s: String) in reply(400, ["error": s]) }
+    let route = path.split(separator: "?").first.map(String.init) ?? path
+
+    switch route {
+    case "/health":
+      return ok(["ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count])
+    case "/list":
+      return ok(["panels": panels.values.sorted { $0.lastActive > $1.lastActive }.map { $0.info() }])
+    case "/register":
+      guard let id = input["id"] as? String, let session = input["session"] as? String else { return fail("id and session required") }
+      if let p = panels[id] { return ok(p.info()) }
+      let p = Panel(id: id, session: session)
+      panels[id] = p
+      tracker.refresh(session)
+      if let url = input["url"] as? String, !url.isEmpty { p.load(url) }
+      log("pane \(id.suffix(6)) registered")
+      let url = input["url"] as? String ?? ""
+      if input["focus"] as? Bool == true {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+          self.focus(p)
+          if url.isEmpty { p.focusURL() }
+        }
+      }
+      return ok(p.info())
+    case "/close":
+      guard let id = input["id"] as? String else { return fail("id required") }
+      closePanel(id)
+      return ok(["closed": id])
+    case "/cookies":
+      let list = input["cookies"] as? [[String: Any]] ?? []
+      var n = 0
+      let group = DispatchGroup()
+      for item in list {
+        var props: [HTTPCookiePropertyKey: Any] = [.name: item["name"] as? String ?? "", .value: item["value"] as? String ?? "",
+                                                   .domain: item["domain"] as? String ?? "", .path: item["path"] as? String ?? "/"]
+        if item["secure"] as? Bool == true { props[.secure] = "TRUE" }
+        if let x = (item["expires"] as? NSNumber)?.doubleValue, x > 0 { props[.expires] = Date(timeIntervalSince1970: x) }
+        if let c = HTTPCookie(properties: props) {
+          group.enter(); n += 1
+          Panel.store.httpCookieStore.setCookie(c) { group.leave() }
+        }
+      }
+      group.notify(queue: .main) { ok(["set": n]) }
+      return
+    case "/cookies/import":
+      let domains = input["domains"] as? [String] ?? []
+      let profile = input["profile"] as? String
+      Rex.queue.async {
+        do {
+          let (cookies, skipped) = try ChromeCookies.read(profile: profile, domains: domains)
+          DispatchQueue.main.async {
+            let group = DispatchGroup()
+            for c in cookies { group.enter(); Panel.store.httpCookieStore.setCookie(c) { group.leave() } }
+            group.notify(queue: .main) {
+              let reloadIDs = input["reload"] as? Bool == true ? self.panels.values.map { p in p.web.reload(); return p.id } : []
+              ok(["imported": cookies.count, "skipped": skipped, "reloaded": reloadIDs])
+            }
+          }
+        } catch {
+          DispatchQueue.main.async { fail(error.localizedDescription) }
+        }
+      }
+      return
+    default: break
+    }
+
+    guard let p = resolve(input["id"]) else {
+      return fail(panels.isEmpty ? "no browser panes; open one with `rexweb open URL`" : "no single pane matches \(input["id"] ?? "")")
+    }
+    p.lastActive = Date()
+
+    switch route {
+    case "/info":
+      ok(p.info())
+    case "/nav", "/open":
+      guard let url = input["url"] as? String else { return fail("url required") }
+      p.load(url) { err in err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": url]) }
+    case "/back": p.web.goBack(); p.waitForLoad { _ in ok(p.info()) }
+    case "/forward": p.web.goForward(); p.waitForLoad { _ in ok(p.info()) }
+    case "/reload": p.web.reload(); p.waitForLoad { _ in ok(p.info()) }
+    case "/focus": focus(p); ok(p.info())
+    case "/eval":
+      let code = input["js"] as? String ?? ""
+      js(p, JS.evaluate(code, asExpression: true), [:]) { v, e in
+        guard let e else { return ok(["value": v ?? NSNull()]) }
+        if !e.contains("SyntaxError") && !e.contains("Unexpected") { return fail(e) }
+        self.js(p, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
+      }
+    case "/snapshot":
+      js(p, JS.snapshot, ["max": input["max"] ?? 400, "textMax": input["text_max"] ?? 6000]) { v, e in e == nil ? ok(v ?? [:]) : fail(e!) }
+    case "/click":
+      js(p, JS.resolve, ["target": input["target"] as? String ?? ""]) { v, e in
+        guard e == nil, let d = v as? [String: Any] else { return fail(e ?? "resolve failed") }
+        if let err = d["error"] as? String { return fail(err) }
+        let x = (d["x"] as? NSNumber)?.doubleValue ?? 0, y = (d["y"] as? NSNumber)?.doubleValue ?? 0
+        self.nativeClick(p, x: x, y: y)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
+      }
+    case "/type":
+      js(p, JS.fill, ["target": input["target"] as? String ?? "", "text": input["text"] as? String ?? "",
+                     "clear": input["clear"] as? Bool ?? false, "submit": input["submit"] as? Bool ?? false]) { v, e in
+        guard e == nil else { return fail(e!) }
+        if let d = v as? [String: Any], let err = d["error"] as? String { return fail(err) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
+      }
+    case "/press":
+      guard let k = input["key"] as? String else { return fail("key required") }
+      if nativeKey(p, k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
+    case "/shot":
+      let path = (input["path"] as? String) ?? NSTemporaryDirectory() + "rexweb-\(p.id.suffix(6))-\(Int(Date().timeIntervalSince1970)).png"
+      p.web.takeSnapshot(with: nil) { img, err in
+        guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return fail(err?.localizedDescription ?? "snapshot failed") }
+        do { try png.write(to: URL(fileURLWithPath: path)); ok(["path": path, "width": rep.pixelsWide, "height": rep.pixelsHigh]) }
+        catch { fail(error.localizedDescription) }
+      }
+    case "/wait":
+      let deadline = Date().addingTimeInterval((input["timeout"] as? NSNumber)?.doubleValue ?? 15)
+      let args: [String: Any] = ["selector": input["selector"] as? String ?? "", "text": input["text"] as? String ?? ""]
+      func poll() {
+        js(p, JS.exists, args) { v, _ in
+          if v as? Bool == true { return ok(p.info()) }
+          if Date() > deadline { return reply(408, ["error": "timed out"]) }
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: poll)
+        }
+      }
+      p.waitForLoad { _ in poll() }
+    default:
+      reply(404, ["error": "unknown route \(route)"])
+    }
+  }
+
+  func nativeClick(_ p: Panel, x: Double, y: Double) {
+    let zoom = p.web.pageZoom * p.web.magnification
+    let pt = p.web.convert(NSPoint(x: x * zoom, y: y * zoom), to: nil)
+    let t = ProcessInfo.processInfo.systemUptime
+    for (type, dt) in [(NSEvent.EventType.leftMouseDown, 0.0), (.leftMouseUp, 0.03)] {
+      if let ev = NSEvent.mouseEvent(with: type, location: pt, modifierFlags: [], timestamp: t + dt,
+                                     windowNumber: p.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
+        p.window.sendEvent(ev)
+      }
+    }
+  }
+
+  func nativeKey(_ p: Panel, _ name: String) -> Bool {
+    let keys: [String: (UInt16, String)] = [
+      "enter": (36, "\r"), "return": (36, "\r"), "tab": (48, "\t"), "escape": (53, "\u{1b}"), "esc": (53, "\u{1b}"),
+      "backspace": (51, "\u{7f}"), "delete": (117, "\u{f728}"), "space": (49, " "),
+      "up": (126, "\u{f700}"), "down": (125, "\u{f701}"), "left": (123, "\u{f702}"), "right": (124, "\u{f703}"),
+      "home": (115, "\u{f729}"), "end": (119, "\u{f72b}"), "pageup": (116, "\u{f72c}"), "pagedown": (121, "\u{f72d}"),
+    ]
+    guard let (code, chars) = keys[name.lowercased()] else { return false }
+    if p.window.firstResponder == nil || p.window.firstResponder === p.window { p.window.makeFirstResponder(p.web) }
+    let t = ProcessInfo.processInfo.systemUptime
+    for type in [NSEvent.EventType.keyDown, .keyUp] {
+      if let ev = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: t, windowNumber: p.window.windowNumber,
+                                   context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
+        p.window.sendEvent(ev)
+      }
+    }
+    return true
+  }
+}
+
+let app = NSApplication.shared
+app.delegate = App.shared
+app.setActivationPolicy(.accessory)
+app.run()
