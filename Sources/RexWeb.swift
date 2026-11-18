@@ -3,38 +3,136 @@ import CommonCrypto
 import SQLite3
 import CoreGraphics
 import Network
+import Security
 import WebKit
 
 struct Config {
-  var top = 46.0, left = 8.0, right = 8.0, bottom = 8.0
-  var gap = 8.0, header = 36.0, radius = 10.0
+  var top: Double?, left: Double?, right: Double?, bottom: Double?
+  var gap: Double?, header: Double?, radius: Double?
   var port = 18802
   var searchURL = "https://www.google.com/search?q=%s"
   var fallbackBrowser = ""
   var linkTarget = "split"
-  var rexBin = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
+  var rexBin = ""
+  var configError: String?
 
   static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
 
+  static func findRex() -> String {
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser.path
+    var candidates: [String] = []
+    for root in ["/Applications", "\(home)/Applications"] {
+      for app in ["Rex", "Rex Beta"] {
+        candidates.append("\(root)/\(app).app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex")
+      }
+    }
+    candidates += ["/opt/homebrew/bin/rex", "/usr/local/bin/rex", "\(home)/.local/bin/rex"]
+    return candidates.first { fm.isExecutableFile(atPath: $0) } ?? "rex"
+  }
+
   static func load() -> Config {
     var c = Config()
-    if let bin = ProcessInfo.processInfo.environment["REX_BIN"], !bin.isEmpty { c.rexBin = bin }
+    defer {
+      if let bin = ProcessInfo.processInfo.environment["REX_BIN"], !bin.isEmpty { c.rexBin = bin }
+      if c.rexBin.isEmpty { c.rexBin = findRex() }
+    }
     let url = dir.appendingPathComponent("config.json")
-    guard let data = try? Data(contentsOf: url),
-          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return c }
-    func d(_ k: String, _ v: inout Double) { if let n = o[k] as? NSNumber { v = n.doubleValue } }
-    d("top", &c.top); d("left", &c.left); d("right", &c.right); d("bottom", &c.bottom)
-    d("gap", &c.gap); d("header", &c.header); d("radius", &c.radius)
+    guard let data = try? Data(contentsOf: url) else { return c }
+    guard let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      c.configError = "~/.rexweb/config.json isn't a valid JSON object"
+      return c
+    }
+    func n(_ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
+    c.top = n("top"); c.left = n("left"); c.right = n("right"); c.bottom = n("bottom")
+    c.gap = n("gap"); c.header = n("header"); c.radius = n("radius")
     if let p = o["port"] as? NSNumber { c.port = p.intValue }
     if let b = o["rex_bin"] as? String { c.rexBin = b }
-    if let u = o["search_url"] as? String, u.contains("%s") { c.searchURL = u }
+    if let u = o["search_url"] as? String {
+      if u.contains("%s") { c.searchURL = u } else { c.configError = "search_url needs %s where the query goes" }
+    }
     if let f = o["fallback_browser"] as? String { c.fallbackBrowser = f }
-    if let t = o["links"] as? String, ["tab", "split"].contains(t) { c.linkTarget = t }
+    if let t = o["links"] as? String {
+      if ["tab", "split"].contains(t) { c.linkTarget = t } else { c.configError = "links must be \"split\" or \"tab\"" }
+    }
     return c
   }
 }
 
 var config = Config.load()
+
+enum Auth {
+  static let file = Config.dir.appendingPathComponent("token")
+
+  static let token: String = {
+    let fm = FileManager.default
+    try? fm.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+    if let t = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), t.count >= 32 {
+      try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+      return t
+    }
+    var bytes = [UInt8](repeating: 0, count: 32)
+    _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+    let t = bytes.map { String(format: "%02x", $0) }.joined()
+    fm.createFile(atPath: file.path, contents: Data(t.utf8), attributes: [.posixPermissions: 0o600])
+    return t
+  }()
+
+  static func matches(_ given: String?) -> Bool {
+    guard let given else { return false }
+    let a = Array(given.utf8), b = Array(token.utf8)
+    guard a.count == b.count else { return false }
+    return zip(a, b).reduce(0) { $0 | ($1.0 ^ $1.1) } == 0
+  }
+}
+
+struct Insets: Equatable {
+  var top, left, right, bottom, gap, header, radius: Double
+  var floatHeader = 36.0
+  var floatTop = 38.0, floatLeft = 0.0, floatRight = 0.0
+}
+
+enum RexChrome {
+  static let domain = "com.superlogical.rex" as CFString
+
+  static func value(_ key: String) -> Any? {
+    CFPreferencesCopyAppValue("Workspace.\(key)" as CFString, domain)
+  }
+
+  static func read() -> Insets {
+    CFPreferencesAppSynchronize(domain)
+    let compact = value("paneDensity") as? String == "compact"
+    let e = compact ? 0.0 : 8.0
+    var i = compact
+      ? Insets(top: 41, left: e, right: e, bottom: e, gap: 2, header: 35, radius: 0)
+      : Insets(top: 46, left: e, right: e, bottom: e, gap: 8, header: 36, radius: 10)
+    let headers = value("paneHeaderVisibility") as? String
+      ?? (((value("showsPaneHeaders") as? NSNumber)?.boolValue ?? true) ? "always" : "never")
+    if headers != "always" { i.header = 0; i.floatHeader = 0 }
+    let toolbar = value("toolbarBehavior") as? String ?? "alwaysShow"
+    i.floatTop = i.top - e
+    if value("tabStyle") as? String != "vertical", toolbar != "alwaysShow" { i.top = e; i.floatTop = 0 }
+    if value("tabStyle") as? String == "vertical" {
+      i.top = e
+      i.floatTop = 38
+      let collapsed = (value("sidebarCollapsed") as? NSNumber)?.boolValue ?? false
+      if !collapsed {
+        let w = (value("sidebarWidth") as? NSNumber)?.doubleValue ?? 0
+        if value("sidebarPosition") as? String == "right" { i.right = w; i.floatRight = w } else { i.left = w; i.floatLeft = w; i.floatTop = 0 }
+      }
+    }
+    if let t = config.top { i.top = t }
+    if let l = config.left { i.left = l }
+    if let r = config.right { i.right = r }
+    if let b = config.bottom { i.bottom = b }
+    if let g = config.gap { i.gap = g }
+    if let h = config.header { i.header = h }
+    if let r = config.radius { i.radius = r }
+    return i
+  }
+}
+
+func orNull(_ v: Any?) -> Any { v ?? NSNull() }
 
 func log(_ s: String) {
   FileHandle.standardError.write(("[rexweb] " + s + "\n").data(using: .utf8)!)
@@ -46,8 +144,13 @@ enum Rex {
   @discardableResult
   static func run(_ args: [String]) -> Data? {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: config.rexBin)
-    p.arguments = args
+    if config.rexBin.contains("/") {
+      p.executableURL = URL(fileURLWithPath: config.rexBin)
+      p.arguments = args
+    } else {
+      p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+      p.arguments = [config.rexBin] + args
+    }
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
@@ -65,10 +168,24 @@ enum Rex {
 
   static func async(_ args: [String]) { queue.async { run(args) } }
 
-  static func isDisplayed(block: String, session: String) -> Bool? {
+  static var version: String?
+  static func checkVersion() {
+    queue.async {
+      let v = run(["version"]).map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }
+      DispatchQueue.main.async { version = v }
+      if v == nil { log("can't run rex at \(config.rexBin); set rex_bin in ~/.rexweb/config.json") }
+    }
+  }
+
+  struct Grid { let columns, rows, cellWidth, cellHeight: Double }
+
+  static func size(block: String, session: String) -> (displayed: Bool, grid: Grid?)? {
     guard let data = run(["block", "call", "-s", session, "-b", block, "size"]),
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    return !((o["desired"] as? [Any]) ?? []).isEmpty
+    let shown = !((o["desired"] as? [Any]) ?? []).isEmpty
+    func n(_ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
+    guard let c = n("columns"), let r = n("rows"), let w = n("cell_width_px"), let h = n("cell_height_px") else { return (shown, nil) }
+    return (shown, Grid(columns: c, rows: r, cellWidth: w, cellHeight: h))
   }
 
   static let labelQueue = DispatchQueue(label: "rexweb.label")
@@ -101,9 +218,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   let forwardButton = NSButton()
   let reloadButton = NSButton()
   var loadWaiters: [(String?) -> Void] = []
+  var lastError: String?
+  var requested: URL?
   var lastLabel = ""
   var visible = false
   var lastFrame = NSRect.zero
+  var layoutKey = ""
+  var settleUntil = Date.distantPast
   var lastActive = Date()
   var focusedInRex = false
   var pendingFocus = false
@@ -129,11 +250,11 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     window.hasShadow = false
     window.backgroundColor = .clear
     window.isOpaque = false
-    window.collectionBehavior = [.managed, .fullScreenAuxiliary]
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
     let root = NSView()
     root.wantsLayer = true
-    root.layer?.cornerRadius = config.radius
+    root.layer?.cornerRadius = 10
     root.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
     root.layer?.masksToBounds = true
     root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
@@ -217,7 +338,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
   func info() -> [String: Any] {
     ["id": id, "session": session, "url": web.url?.absoluteString ?? "", "title": web.title ?? "",
-     "loading": web.isLoading, "visible": visible]
+     "loading": web.isLoading, "visible": visible, "error": orNull(lastError)]
   }
 
   static func normalize(_ raw: String) -> URL? {
@@ -235,6 +356,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
 
   func load(_ raw: String, done: ((String?) -> Void)? = nil) {
     guard let url = Panel.normalize(raw) else { done?("bad url"); return }
+    requested = url
     if let done { loadWaiters.append(done) }
     if url.isFileURL {
       web.loadFileURL(url, allowingReadAccessTo: URL(fileURLWithPath: "/"))
@@ -243,8 +365,13 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     }
   }
 
+  var refusedError: String? {
+    guard let req = requested, req.scheme != "about", web.url == nil || web.url?.absoluteString == "about:blank" else { return nil }
+    return "WebKit didn't load \(req.absoluteString). Its port may be one WebKit blocks"
+  }
+
   func waitForLoad(_ done: @escaping (String?) -> Void) {
-    if !web.isLoading { done(nil); return }
+    if !web.isLoading { done(lastError ?? refusedError); return }
     loadWaiters.append(done)
   }
 
@@ -267,10 +394,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     urlField.currentEditor()?.selectAll(nil)
   }
 
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { finishWaiters(nil); updateChrome() }
-  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { finishWaiters(error.localizedDescription) }
-  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-    finishWaiters(error.localizedDescription)
+  func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { lastError = nil }
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { lastError = nil; finishWaiters(nil); updateChrome() }
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
+
+  func failed(_ error: Error) {
+    let e = error as NSError
+    if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
+    lastError = e.localizedDescription
+    finishWaiters(lastError)
   }
 
   var popups: [Popup] = []
@@ -476,13 +609,16 @@ struct RexWindow { let number: Int; let name: String; let bounds: CGRect }
 final class Tracker {
   var views: [String: [String: Any]] = [:]
   var displayed: [String: Bool] = [:]
+  var grids: [String: Rex.Grid] = [:]
   var refreshing = Set<String>()
   var dirty = Set<String>()
   var eventsProcess: Process?
   var rexWasActive = false
+  var insets = RexChrome.read()
 
   func start() {
     Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+    Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.insets = RexChrome.read() }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
     startEvents()
   }
@@ -516,10 +652,16 @@ final class Tracker {
     Rex.queue.async {
       let v = Rex.view(session)
       var shown: [String: Bool] = [:]
-      for id in ids { if let d = Rex.isDisplayed(block: id, session: session) { shown[id] = d } }
+      var grids: [String: Rex.Grid] = [:]
+      for id in ids {
+        guard let sz = Rex.size(block: id, session: session) else { continue }
+        shown[id] = sz.displayed
+        if let g = sz.grid { grids[id] = g }
+      }
       DispatchQueue.main.async {
         self.refreshing.remove(session)
         for (id, d) in shown { self.displayed[id] = d }
+        for (id, g) in grids { self.grids[id] = g }
         if let v { self.views[session] = v; self.reconcile(session) }
         if self.dirty.remove(session) != nil { self.refresh(session) }
       }
@@ -555,13 +697,13 @@ final class Tracker {
       let layer = w[kCGWindowLayer as String] as? Int ?? 0
       guard layer == 0, owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
       guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
-            let r = CGRect(dictionaryRepresentation: bd), r.width > 200 else { continue }
+            let r = CGRect(dictionaryRepresentation: bd), r.width > 200, r.height > 200 else { continue }
       rex.append(RexWindow(number: n, name: w[kCGWindowName as String] as? String ?? "", bounds: r))
     }
     return (rex, order)
   }
 
-  static func placement(of id: String, in view: [String: Any]) -> CGRect? {
+  static func placement(of id: String, in view: [String: Any]) -> (rect: CGRect, floating: Bool)? {
     guard let active = view["active_window_id"] as? String,
           let windows = view["windows"] as? [[String: Any]],
           let win = windows.first(where: { w in
@@ -571,15 +713,13 @@ final class Tracker {
           }),
           win["window_id"] as? String == active else { return nil }
     if let z = win["zoomed_block_id"] as? String, !z.isEmpty {
-      return z == id ? CGRect(x: 0, y: 0, width: 1, height: 1) : nil
+      return z == id ? (CGRect(x: 0, y: 0, width: 1, height: 1), false) : nil
     }
     for l in win["layers"] as? [[String: Any]] ?? [] {
-      let lb = rect(l["bounds"]) ?? CGRect(x: 0, y: 0, width: 1, height: 1)
       if let r = find(id, in: l["layout"]) {
-        if l["kind"] as? String == "tiled" { return r }
+        if l["kind"] as? String == "tiled" { return (r, false) }
         if (l["state"] as? String) == "minimized" { return nil }
-        return CGRect(x: lb.minX + r.minX * lb.width, y: lb.minY + r.minY * lb.height,
-                      width: r.width * lb.width, height: r.height * lb.height)
+        return (r, true)
       }
     }
     return nil
@@ -614,24 +754,35 @@ final class Tracker {
     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
 
     for p in panels {
-      guard displayed[p.id] == true, let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
+      guard displayed[p.id] == true, let v = views[p.session], let place = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
       let label = v["label"] as? String ?? ""
-      guard let rw = rexWins.first(where: { $0.name == "Rex - \(label)" || $0.name == label })
-              ?? (rexWins.count == 1 ? rexWins[0] : nil) else { hide(p); continue }
+      let ins = insets
+      let frac = place.rect
+      var rw = rexWins.first(where: { $0.name == label || $0.name.hasSuffix(" - \(label)") })
+      if rw == nil, rexWins.count == 1 { rw = rexWins[0] }
+      if rw == nil, rexWins.count > 1, let g = grids[p.id] {
+        let scored = rexWins.map { w -> (RexWindow, Double) in
+          let body = Tracker.body(frac, floating: place.floating, in: w.bounds, ins).body
+          let s = Tracker.scale(at: w.bounds, primaryHeight: primaryHeight)
+          return (w, abs(body.width - g.columns * g.cellWidth / s) + abs(body.height - g.rows * g.cellHeight / s))
+        }
+        if let best = scored.min(by: { $0.1 < $1.1 }) { rw = best.0 }
+      }
+      guard let rw else { hide(p); continue }
 
-      let b = rw.bounds
-      let area = CGRect(x: b.minX + config.left, y: b.minY + config.top,
-                        width: b.width - config.left - config.right, height: b.height - config.top - config.bottom)
-      var card = CGRect(x: area.minX + frac.minX * area.width, y: area.minY + frac.minY * area.height,
-                        width: frac.width * area.width, height: frac.height * area.height)
-      let g = config.gap / 2, eps = 0.001
-      if frac.minX > eps { card.origin.x += g; card.size.width -= g }
-      if frac.maxX < 1 - eps { card.size.width -= g }
-      if frac.minY > eps { card.origin.y += g; card.size.height -= g }
-      if frac.maxY < 1 - eps { card.size.height -= g }
-      let body = CGRect(x: card.minX, y: card.minY + config.header, width: card.width, height: card.height - config.header)
+      let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
+      if key != p.layoutKey {
+        p.layoutKey = key
+        p.settleUntil = Date().addingTimeInterval(0.4)
+        if p.window.isKeyWindow { p.pendingFocus = true }
+      }
+      if Date() < p.settleUntil { hide(p); continue }
+      let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
+      if let l = p.window.contentView?.layer, l.cornerRadius != CGFloat(radius) { l.cornerRadius = CGFloat(radius) }
       guard body.width > 20, body.height > 20 else { hide(p); continue }
-      let ns = NSRect(x: body.minX, y: primaryHeight - body.maxY, width: body.width, height: body.height)
+      let x0 = (body.minX).rounded(.up), x1 = (body.maxX).rounded(.down)
+      let y0 = (body.minY).rounded(.up), y1 = (body.maxY).rounded(.down)
+      let ns = NSRect(x: x0, y: primaryHeight - y1, width: x1 - x0, height: y1 - y0)
       if ns != p.lastFrame { p.window.setFrame(ns, display: true); p.lastFrame = ns }
 
       let mine = p.window.windowNumber
@@ -657,6 +808,33 @@ final class Tracker {
     rexWasActive = rexActive
   }
 
+  static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
+    let area = floating
+      ? CGRect(x: b.minX + ins.floatLeft, y: b.minY + ins.floatTop,
+               width: b.width - ins.floatLeft - ins.floatRight, height: b.height - ins.floatTop)
+      : CGRect(x: b.minX + ins.left, y: b.minY + ins.top,
+               width: b.width - ins.left - ins.right, height: b.height - ins.top - ins.bottom)
+    var card = CGRect(x: area.minX + frac.minX * area.width, y: area.minY + frac.minY * area.height,
+                      width: frac.width * area.width, height: frac.height * area.height)
+    var header = ins.header, radius = ins.radius
+    if floating {
+      card = card.insetBy(dx: 2, dy: 2)
+      header = ins.floatHeader; radius = 10
+    } else {
+      let g = ins.gap / 2, eps = 0.001
+      if frac.minX > eps { card.origin.x += g; card.size.width -= g }
+      if frac.maxX < 1 - eps { card.size.width -= g }
+      if frac.minY > eps { card.origin.y += g; card.size.height -= g }
+      if frac.maxY < 1 - eps { card.size.height -= g }
+    }
+    return (CGRect(x: card.minX, y: card.minY + header, width: card.width, height: card.height - header), radius)
+  }
+
+  static func scale(at r: CGRect, primaryHeight: CGFloat) -> Double {
+    let center = NSPoint(x: r.midX, y: primaryHeight - r.midY)
+    return Double(NSScreen.screens.first { $0.frame.contains(center) }?.backingScaleFactor ?? 2)
+  }
+
   func hide(_ p: Panel) {
     if p.visible { p.window.orderOut(nil); p.visible = false }
   }
@@ -664,6 +842,23 @@ final class Tracker {
 
 final class Server {
   var listener: NWListener!
+
+  static func refuse(method: String, path: String, headers: [String: String]) -> (Int, String)? {
+    if headers["origin"] != nil || headers["sec-fetch-site"] != nil || headers["sec-fetch-mode"] != nil {
+      return (403, "rexweb doesn't accept requests from web pages")
+    }
+    let host = headers["host"] ?? ""
+    guard host == "127.0.0.1:\(config.port)" || host == "localhost:\(config.port)" else {
+      return (403, "rexweb only accepts requests to 127.0.0.1:\(config.port)")
+    }
+    guard method == "POST" else { return (405, "use POST") }
+    let route = path.split(separator: "?").first.map(String.init) ?? path
+    if route == "/health" { return nil }
+    guard Auth.matches(headers["x-rexweb-token"]) else {
+      return (401, "missing or wrong token; send the contents of ~/.rexweb/token in an x-rexweb-token header")
+    }
+    return nil
+  }
 
   func start() {
     do {
@@ -690,17 +885,26 @@ final class Server {
         return done ? conn.cancel() : self.read(conn, buf)
       }
       let head = String(decoding: buf[..<split.lowerBound], as: UTF8.self)
-      let length = head.split(separator: "\r\n").first { $0.lowercased().hasPrefix("content-length:") }
-        .flatMap { Int($0.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) } ?? 0
+      let lines = head.split(separator: "\r\n")
+      var headers: [String: String] = [:]
+      for line in lines.dropFirst() {
+        guard let c = line.firstIndex(of: ":") else { continue }
+        headers[line[..<c].lowercased()] = line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)
+      }
+      let length = Int(headers["content-length"] ?? "") ?? 0
       let body = buf[split.upperBound...]
       if body.count < length && !done { return self.read(conn, buf) }
-      let path = head.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
-      let input = (try? JSONSerialization.jsonObject(with: Data(body))) as? [String: Any] ?? [:]
-      App.shared.handle(path: path, input: input) { status, out in
+      let request = lines.first?.split(separator: " ") ?? []
+      let method = request.first.map(String.init) ?? ""
+      let path = request.dropFirst().first.map(String.init) ?? "/"
+      let respond = { (status: Int, out: Any) in
         let bytes = (try? JSONSerialization.data(withJSONObject: out, options: [.fragmentsAllowed])) ?? Data("{}".utf8)
         let top = "HTTP/1.1 \(status) X\r\ncontent-type: application/json\r\ncontent-length: \(bytes.count)\r\nconnection: close\r\n\r\n"
         conn.send(content: Data(top.utf8) + bytes, completion: .contentProcessed { _ in conn.cancel() })
       }
+      if let refusal = Server.refuse(method: method, path: path, headers: headers) { return respond(refusal.0, ["error": refusal.1]) }
+      let input = (try? JSONSerialization.jsonObject(with: Data(body))) as? [String: Any] ?? [:]
+      App.shared.handle(path: path, input: input, reply: respond)
     }
   }
 }
@@ -793,17 +997,23 @@ enum Links {
   }
 
   static func forward(_ url: URL) {
-    guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: fallbackID) else { return }
+    guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: fallbackID)
+            ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari") else {
+      log("no browser to pass \(url) to"); return
+    }
     NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
   }
 
   static func frontRexSession() -> String? {
     guard let win = Tracker.rexWindows().rex.first else { return nil }
-    let label = win.name.hasPrefix("Rex - ") ? String(win.name.dropFirst(6)) : win.name
     guard let data = Rex.run(["ls", "--json"]),
           let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let sessions = o["sessions"] as? [[String: Any]] else { return nil }
-    return sessions.first { $0["label"] as? String == label }?["session_id"] as? String
+    let match = sessions.filter { s in
+      guard let l = s["label"] as? String, !l.isEmpty else { return false }
+      return win.name == l || win.name.hasSuffix(" - \(l)")
+    }.max { ($0["label"] as? String ?? "").count < ($1["label"] as? String ?? "").count }
+    return match?["session_id"] as? String
   }
 
   static func openInRex(_ url: URL) {
@@ -861,8 +1071,15 @@ final class App: NSObject, NSApplicationDelegate {
     if sender.hasPrefix("com.superlogical.rex") { Links.openInRex(url) } else { Links.forward(url) }
   }
 
+  func application(_ sender: NSApplication, open urls: [URL]) {
+    urls.forEach { Links.openInRex($0) }
+  }
+
   func applicationDidFinishLaunching(_ n: Notification) {
     try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+    _ = Auth.token
+    Rex.checkVersion()
+    if let e = config.configError { log(e) }
     buildMenu()
     server.start()
     tracker.start()
@@ -908,6 +1125,7 @@ final class App: NSObject, NSApplicationDelegate {
       }
     }
     if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
+    if m == [.command, .shift], c == "b" { openPane(beside: p.id, session: p.session, url: ""); return true }
     if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
       let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
       if let dir { returnToRex(p, focus: dir); return true }
@@ -943,7 +1161,8 @@ final class App: NSObject, NSApplicationDelegate {
 
   func openPane(beside id: String, session: String, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
-    Rex.async(["split", "-s", session, "-b", id, "--split=right", "--shell=none", "--", pane, url])
+    Rex.async(["split", "-s", session, "-b", id, "--split=right", "--shell=none", "--label", "browser",
+               "--", "env", "REXWEB_FOCUS=true", pane, url])
   }
 
   func resolve(_ raw: Any?) -> Panel? {
@@ -970,7 +1189,15 @@ final class App: NSObject, NSApplicationDelegate {
 
     switch route {
     case "/health":
-      return ok(["ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count])
+      let wins = Tracker.rexWindows().rex
+      return ok([
+        "ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count,
+        "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
+        "port": config.port, "rex_bin": config.rexBin, "rex_version": orNull(Rex.version),
+        "rex_windows": wins.count,
+        "window_names": wins.isEmpty ? NSNull() as Any : wins.contains { !$0.name.isEmpty } as Any,
+        "config_error": orNull(config.configError),
+      ])
     case "/list":
       return ok(["panels": panels.values.sorted { $0.lastActive > $1.lastActive }.map { $0.info() }])
     case "/register":
@@ -1046,9 +1273,26 @@ final class App: NSObject, NSApplicationDelegate {
     switch route {
     case "/info":
       ok(p.info())
+    case "/loaded":
+      var replied = false
+      let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30
+      DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+        if !replied { replied = true; reply(408, ["error": "the page was still loading after \(Int(timeout))s", "url": p.web.url?.absoluteString ?? ""]) }
+      }
+      p.waitForLoad { err in
+        guard !replied else { return }
+        replied = true
+        err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": p.web.url?.absoluteString ?? ""])
+      }
     case "/nav", "/open":
       guard let url = input["url"] as? String else { return fail("url required") }
-      p.load(url) { err in err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": url]) }
+      p.load(url) { err in
+        let e = err ?? p.refusedError
+        e == nil ? ok(p.info()) : reply(502, ["error": e!, "url": url])
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        if !p.web.isLoading, let e = p.refusedError { p.finishWaiters(e) }
+      }
     case "/back": p.web.goBack(); p.waitForLoad { _ in ok(p.info()) }
     case "/forward": p.web.goForward(); p.waitForLoad { _ in ok(p.info()) }
     case "/reload": p.web.reload(); p.waitForLoad { _ in ok(p.info()) }
@@ -1082,6 +1326,7 @@ final class App: NSObject, NSApplicationDelegate {
       if nativeKey(p, k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
     case "/shot":
       let path = (input["path"] as? String) ?? NSTemporaryDirectory() + "rexweb-\(p.id.suffix(6))-\(Int(Date().timeIntervalSince1970)).png"
+      guard path.lowercased().hasSuffix(".png") else { return fail("screenshot path must end in .png") }
       p.web.takeSnapshot(with: nil) { img, err in
         guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]) else { return fail(err?.localizedDescription ?? "snapshot failed") }
@@ -1098,7 +1343,10 @@ final class App: NSObject, NSApplicationDelegate {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: poll)
         }
       }
-      p.waitForLoad { _ in poll() }
+      p.waitForLoad { err in
+        if let err { return reply(502, ["error": err, "url": p.web.url?.absoluteString ?? ""]) }
+        poll()
+      }
     default:
       reply(404, ["error": "unknown route \(route)"])
     }

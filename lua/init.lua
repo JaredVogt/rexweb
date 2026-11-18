@@ -16,7 +16,9 @@
 local M = {}
 
 local SHELL = "com.superlogical.terminal.shell"
-local APP = os.getenv("HOME") .. "/Applications/RexWeb.app"
+local APPDIR = "@APPDIR@"
+if APPDIR:sub(1, 1) == "@" then APPDIR = os.getenv("HOME") .. "/Applications" end
+local APP = APPDIR .. "/RexWeb.app"
 local PANE = APP .. "/Contents/Resources/rexweb-pane"
 
 local defaults = {

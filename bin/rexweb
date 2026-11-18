@@ -2,7 +2,8 @@
 # rexweb: native WebKit browser panes for Rex.
 set -eo pipefail
 
-port="${REXWEB_PORT:-18802}"
+cfg="$HOME/.rexweb/config.json"
+port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
 self="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 
 # ---------------------------------------------------------------- help text
@@ -40,11 +41,17 @@ Sign-in and links:
   cookies     Import cookies, such as a sign-in from Chrome
   links       Open links you click in Rex in a browser pane
 
+Setup:
+  doctor      Check that rexweb is installed and can see Rex
+  skill       Print the guide for coding agents
+
 Options:
-  -h, --help  help for rexweb
+  -h, --help     help for rexweb
+  -v, --version  print the version
 
 Every command that acts on a pane takes -b BLOCK, a pane's ID, ID suffix, or
-label. Without it, rexweb uses the browser pane you used most recently.
+title. Without it, rexweb uses the browser pane you used most recently. Scripts
+and agents should pass the ID that "rexweb open" prints.
 
 Run "rexweb [command] --help" for more information about a command.
 EOF
@@ -58,7 +65,11 @@ Open a browser pane beside a Rex pane.
 URL can be a full URL, a host such as example.com, a port such as 3000 for
 localhost:3000, or words to search for. Without URL, the pane opens with the
 address bar focused. By default the new pane goes to the right of the current
-pane, takes focus, and prints its block ID.
+pane and takes focus.
+
+open prints the new pane's block ID, then waits for the page to load. If the
+page doesn't load, it still prints the ID, writes the error to stderr, and
+exits 1. It warns on stderr if Rex isn't showing the pane.
 
 Examples:
   rexweb open localhost:3000
@@ -75,8 +86,28 @@ Options:
   -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK, then the focused pane)
   -s, --session SESSION  open in SESSION (defaults to REX_SESSION)
       --tab              open the pane in a new tab instead of a split
-      --focus            focus the new pane (default true)
-      --json             output the result as JSON
+      --focus=BOOL       focus the new pane (default true)
+      --no-wait          print the ID without waiting for the page to load
+      --json             output the result as JSON: {id, session, url, title, loading, visible, error}
+EOF
+    ;;
+    doctor) cat <<'EOF'
+Check that rexweb is installed and working, and print what to fix.
+
+Each check prints "ok" or "FAIL". doctor exits 1 if any check fails.
+
+Usage:
+  rexweb doctor [flags]
+
+Options:
+      --json  output the checks as JSON
+EOF
+    ;;
+    skill) cat <<'EOF'
+Print the guide for coding agents that use rexweb.
+
+Usage:
+  rexweb skill
 EOF
     ;;
     ls|list) cat <<'EOF'
@@ -221,10 +252,13 @@ Options:
       --selector SELECTOR wait until SELECTOR matches an element
       --text TEXT         wait until the page's text contains TEXT
       --timeout SECONDS   give up after SECONDS (default 15)
+
+wait exits 1 if the page fails to load, or if SECONDS pass first.
 EOF
     ;;
     screenshot|shot) cat <<'EOF'
-Save a PNG of the page and print its path.
+Save a PNG of the page and print its path. PATH must end in .png. Without it,
+rexweb saves the PNG in a temporary directory.
 
 Usage:
   rexweb screenshot [PATH] [flags]
@@ -239,7 +273,7 @@ Import cookies into rexweb's browser profile, which every browser pane shares.
 Sites that sign in with a passkey or security key can't do that in rexweb: macOS
 only offers passkeys to browsers Apple has approved. Sign in with Chrome
 instead, then import the sign-in. The first import asks for the "Chrome Safe
-Storage" key in your Keychain.
+Storage" key in your Keychain, so someone must be at the screen to allow it.
 
 Commands:
   import      Import cookies from your Chrome profile
@@ -267,8 +301,8 @@ and every other link in your usual browser.
 "links on" makes RexWeb your default browser. It opens links from Rex itself
 and passes every other link straight to the browser you had before, so links
 from other apps, and from "open" in a shell, behave as they did. macOS asks you
-to confirm the change. "links off" makes your previous browser the default
-again.
+to confirm the change, so someone must be at the screen. "links off" makes your
+previous browser the default again.
 
 Commands:
   on          Route links clicked in Rex to browser panes
@@ -290,10 +324,33 @@ EOF
 
 die() { echo "Error: $*" >&2; exit 1; }
 
+token() { cat "$HOME/.rexweb/token" 2>/dev/null || true; }
+
+raw() {
+  curl -s -m "${3:-1}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
+    -H "x-rexweb-token: $(token)" -d "${2:-{\}}"
+}
+
+app_path() {
+  for a in "${self%/Contents/Resources}" "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app"; do
+    case "$a" in *.app) [ -d "$a" ] && { echo "$a"; return; } ;; esac
+  done
+}
+
+ensure_app() {
+  raw /health >/dev/null 2>&1 && return 0
+  local app; app="$(app_path)"
+  [ -n "$app" ] || die "RexWeb.app isn't installed. Run ./install.sh in the rexweb repo."
+  open -g "$app"
+  for _ in $(seq 1 50); do raw /health >/dev/null 2>&1 && return 0; sleep 0.1; done
+  die "RexWeb.app didn't start. Run \"rexweb doctor\"."
+}
+
 api() {
   local path="$1" body="${2:-{\}}" timeout="${3:-30}" out code
   out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
-    -H 'content-type: application/json' -d "$body")" || die "rexweb isn't running. Open a pane with \"rexweb open\" to start it."
+    -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" ||
+    die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [ "$code" -ge 400 ]; then die "$(jq -r '.error // .' <<<"$out" 2>/dev/null || echo "$out")"; fi
   printf '%s\n' "$out"
@@ -323,6 +380,8 @@ parse() {
 
 target() { jq -nc --arg id "$block" '{id:$id}'; }
 
+need() { [ "$1" -ge 2 ] || die "flag needs an argument: $2"; }
+
 pane_line() { jq -r '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)"'; }
 
 print_info() { if [ "$json" = 1 ]; then jq .; else pane_line; fi; }
@@ -335,20 +394,66 @@ case "$cmd" in
   help|-h|--help)
     if [ $# -gt 0 ]; then help_cmd "$1"; else help_root; fi ;;
 
+  -v|--version|version)
+    plist="$(app_path)/Contents/Info.plist"
+    echo "rexweb $(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$plist" 2>/dev/null || echo unknown)"
+    ;;
+
+  skill)
+    for g in "$self/AGENTS.md" "$self/../AGENTS.md"; do [ -f "$g" ] && { cat "$g"; exit 0; }; done
+    die "AGENTS.md not found. Reinstall rexweb."
+    ;;
+
+  doctor)
+    parse "$@"
+    checks=() failed=0
+    check() {
+      local ok="$1" name="$2" detail="$3"
+      [ "$ok" = 1 ] || failed=1
+      checks+=("$(jq -nc --argjson ok "$([ "$ok" = 1 ] && echo true || echo false)" --arg n "$name" --arg d "$detail" '{ok:$ok, check:$n, detail:$d}')")
+      [ "$json" = 1 ] || printf '%-5s %-14s %s\n' "$([ "$ok" = 1 ] && echo ok || echo FAIL)" "$name" "$detail"
+    }
+    if command -v rexweb >/dev/null 2>&1; then check 1 path "rexweb is $(command -v rexweb)"
+    else check 0 path "rexweb isn't on PATH. Add: export PATH=\"\$HOME/.local/bin:\$PATH\""; fi
+    if command -v rex >/dev/null 2>&1 && rv="$(rex version 2>/dev/null | head -1)"; then check 1 rex "$rv"
+    else check 0 rex "the rex command doesn't work. Install Rex: https://www.superlogical.com/rex/docs/installation"; fi
+    app="$(app_path)"
+    if [ -n "$app" ]; then check 1 app "$app"; else check 0 app "RexWeb.app isn't installed. Run ./install.sh in the rexweb repo"; fi
+    if [ -f "$HOME/.config/rex/rexweb/init.lua" ] && grep -Eqs "require[[:space:]]*\(?[\"']rexweb" "${REX_CONFIG:-$HOME/.config/rex/init.lua}"; then
+      check 1 lua "Shift-Cmd-B and the palette actions are set up"
+    else check 0 lua "the rexweb Lua module isn't set up. Run ./install.sh in the rexweb repo"; fi
+    if [ -f "$cfg" ] && ! jq -e 'type == "object"' "$cfg" >/dev/null 2>&1; then check 0 config "$cfg isn't a valid JSON object"; fi
+    if [ -n "$app" ] && { raw /health >/dev/null 2>&1 || { open -g "$app"; for _ in $(seq 1 50); do raw /health >/dev/null 2>&1 && break; sleep 0.1; done; raw /health >/dev/null 2>&1; }; }; then
+      h="$(raw /health)"
+      check 1 running "RexWeb $(jq -r .version <<<"$h") on 127.0.0.1:$port, $(jq -r .panels <<<"$h") panes"
+      if [ "$(jq -r '.rex_version // empty' <<<"$h")" != "" ]; then check 1 app-rex "RexWeb runs $(jq -r .rex_bin <<<"$h")"
+      else check 0 app-rex "RexWeb can't run $(jq -r .rex_bin <<<"$h"). Set \"rex_bin\" in $cfg to the output of: command -v rex"; fi
+      if [ "$(jq -r .rex_windows <<<"$h")" -gt 0 ]; then check 1 window "RexWeb sees $(jq -r .rex_windows <<<"$h") Rex window(s)"
+      else check 0 window "RexWeb sees no Rex window. Open Rex on this screen; browser panes only show while their Rex window is visible"; fi
+      ce="$(jq -r '.config_error // empty' <<<"$h")"; [ -n "$ce" ] && check 0 config "$ce"
+      if [ -n "$(token)" ] && raw /list >/dev/null 2>&1 && jq -e '.panels' >/dev/null 2>&1 <<<"$(raw /list)"; then check 1 token "the CLI can talk to RexWeb"
+      else check 0 token "RexWeb refused the CLI's token. Restart it: pkill -x RexWeb"; fi
+    else check 0 running "RexWeb isn't answering on 127.0.0.1:$port. Run: pkill -x RexWeb, then rexweb doctor"; fi
+    if [ "$json" = 1 ]; then printf '%s\n' "${checks[@]}" | jq -s --argjson f "$failed" '{ok: ($f == 0), checks: .}'; fi
+    exit "$failed"
+    ;;
+
   open|new)
     cmd=open
-    url="" split="right" ratio="" anchor="${REX_BLOCK:-}" session="${REX_SESSION:-}" tab=0 focus=true
+    url="" split="right" ratio="" anchor="${REX_BLOCK:-}" session="${REX_SESSION:-}" tab=0 focus=true wait=1
     while [ $# -gt 0 ]; do
       case "$1" in
-        --split) split="$2"; shift 2 ;;
+        --split) need $# "$1"; split="$2"; shift 2 ;;
         --split=*) split="${1#*=}"; shift ;;
-        --ratio) ratio="$2"; shift 2 ;;
+        --ratio) need $# "$1"; ratio="$2"; shift 2 ;;
         --ratio=*) ratio="${1#*=}"; shift ;;
-        -b|--block) anchor="$2"; shift 2 ;;
-        -s|--session) session="$2"; shift 2 ;;
+        -b|--block) need $# "$1"; anchor="$2"; shift 2 ;;
+        -s|--session) need $# "$1"; session="$2"; shift 2 ;;
         --tab) tab=1; shift ;;
-        --focus) focus=true; shift ;;
+        --focus) if [ "${2:-}" = true ] || [ "${2:-}" = false ]; then focus="$2"; shift 2; else focus=true; shift; fi ;;
         --focus=*) focus="${1#*=}"; shift ;;
+        --no-focus) focus=false; shift ;;
+        --no-wait) wait=0; shift ;;
         --json) json=1; shift ;;
         -h|--help) help_cmd open; exit 0 ;;
         -*) die "unknown flag: $1" ;;
@@ -357,6 +462,8 @@ case "$cmd" in
     done
     case "$split" in right|left|above|below) ;; *) die "invalid --split \"$split\": use right, left, above, or below" ;; esac
     case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
+    if [ -n "$ratio" ]; then case "$ratio" in *[!0-9]*) die "invalid --ratio \"$ratio\": use a percent from 1 to 99" ;; esac; fi
+    command -v rex >/dev/null 2>&1 || die "the rex command isn't on PATH. Install Rex, or run this from a Rex pane."
     pb="$(pane_bin)"
     opts=(--shell=none --label browser --json --focus="$focus")
     [ -n "$session" ] && opts+=(-s "$session")
@@ -368,17 +475,36 @@ case "$cmd" in
       [ -n "$anchor" ] && opts+=(-b "$anchor")
       res="$(rex split "${opts[@]}" -- env REXWEB_FOCUS="$focus" "$pb" "$url")"
     fi
-    id="$(jq -r '.block_ids[0]' <<<"$res")"
-    # The pane starts RexWeb if it isn't running, then registers with it.
-    for _ in $(seq 1 80); do
-      if info="$(curl -s -m 1 -X POST "http://127.0.0.1:$port/info" -d "$(jq -nc --arg id "$id" '{id:$id}')")" &&
-         jq -e --arg id "$id" '.id == $id' >/dev/null 2>&1 <<<"$info"; then
-        if [ "$json" = 1 ]; then jq . <<<"$info"; else echo "$id"; fi
-        exit 0
-      fi
+    id="$(jq -r '.block_ids[0] // empty' <<<"$res" 2>/dev/null)"
+    [ -n "$id" ] || die "Rex didn't open a pane: $res"
+    target_id="$(jq -nc --arg id "$id" '{id:$id}')"
+    registered=0
+    for _ in $(seq 1 100); do
+      if info="$(raw /info "$target_id")" && jq -e --arg id "$id" '.id == $id' >/dev/null 2>&1 <<<"$info"; then registered=1; break; fi
       sleep 0.1
     done
-    die "opened pane $id, but rexweb didn't pick it up. Check \"rexweb ls\"."
+    if [ "$registered" = 0 ]; then
+      echo "$id"
+      die "opened pane $id, but RexWeb didn't pick it up. Run \"rexweb doctor\"."
+    fi
+    err=""
+    if [ "$wait" = 1 ]; then
+      out="$(curl -s -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" -H "x-rexweb-token: $(token)" \
+        -d "$(jq -nc --arg id "$id" '{id:$id, timeout:30}')")" || out=$'{}\n000'
+      code="${out##*$'\n'}"; out="${out%$'\n'*}"
+      if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null)"; fi
+    fi
+    for _ in $(seq 1 30); do
+      info="$(raw /info "$target_id")"
+      [ "$(jq -r .visible <<<"$info" 2>/dev/null)" = true ] && break
+      sleep 0.1
+    done
+    if [ "$json" = 1 ]; then jq . <<<"$info"; else echo "$id"; fi
+    if [ "$(jq -r .visible <<<"$info" 2>/dev/null)" != true ]; then
+      echo "Warning: Rex isn't showing pane $id yet. Is its Rex window open on this screen? Run \"rexweb doctor\" if it doesn't appear." >&2
+    fi
+    [ -z "$err" ] || die "the page didn't load: $err"
+    exit 0
     ;;
 
   ls|list)
@@ -419,7 +545,7 @@ case "$cmd" in
     ;;
 
   type|fill)
-    cmd=type; parse "$@"
+    cmd="type"; parse "$@"
     clear=false submit=false words=()
     for a in "${rest[@]}"; do
       case "$a" in --clear) clear=true ;; --submit) submit=true ;; *) words+=("$a") ;; esac
@@ -437,7 +563,7 @@ case "$cmd" in
     ;;
 
   eval|js)
-    cmd=eval; parse "$@"
+    cmd="eval"; parse "$@"
     [ ${#rest[@]} -ge 1 ] || die "eval needs JS. Run \"rexweb eval --help\"."
     api /eval "$(jq -nc --arg id "$block" --arg j "${rest[*]}" '{id:$id, js:$j}')" 60 | jq '.value'
     ;;
@@ -448,12 +574,13 @@ case "$cmd" in
     set -- ${rest[@]+"${rest[@]}"}
     while [ $# -gt 0 ]; do
       case "$1" in
-        --selector) sel="$2"; shift 2 ;;
-        --text) text="$2"; shift 2 ;;
-        --timeout) timeout="$2"; shift 2 ;;
+        --selector) need $# "$1"; sel="$2"; shift 2 ;;
+        --text) need $# "$1"; text="$2"; shift 2 ;;
+        --timeout) need $# "$1"; timeout="$2"; shift 2 ;;
         *) die "unknown argument: $1" ;;
       esac
     done
+    case "$timeout" in ''|*[!0-9.]*) die "invalid --timeout \"$timeout\": use a number of seconds" ;; esac
     api /wait "$(jq -nc --arg id "$block" --arg s "$sel" --arg t "$text" --argjson to "$timeout" \
       '{id:$id, selector:$s, text:$t, timeout:$to}')" $((timeout + 5)) | print_info
     ;;
@@ -475,19 +602,16 @@ case "$cmd" in
         domains=() profile="" reload=false
         while [ $# -gt 0 ]; do
           case "$1" in
-            --domain) domains+=("$2"); shift 2 ;;
+            --domain) need $# "$1"; domains+=("$2"); shift 2 ;;
             --domain=*) domains+=("${1#*=}"); shift ;;
-            --profile) profile="$2"; shift 2 ;;
+            --profile) need $# "$1"; profile="$2"; shift 2 ;;
             --reload) reload=true; shift ;;
             --json) json=1; shift ;;
             -h|--help) help_cmd cookies; exit 0 ;;
             *) die "unknown argument: $1" ;;
           esac
         done
-        curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 || {
-          open -g "$HOME/Applications/RexWeb.app" 2>/dev/null || open -g -a RexWeb
-          for _ in $(seq 1 50); do curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 0.1; done
-        }
+        ensure_app
         body="$(jq -nc --arg p "$profile" --argjson r "$reload" '{profile:(if $p == "" then null else $p end), reload:$r, domains:$ARGS.positional}' \
           --args ${domains[@]+"${domains[@]}"})"
         out="$(api /cookies/import "$body" 180)"
@@ -508,10 +632,7 @@ case "$cmd" in
     case "$sub" in
       -h|--help|help) help_cmd links; exit 0 ;;
     esac
-    curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 || {
-      open -g "$HOME/Applications/RexWeb.app" 2>/dev/null || open -g -a RexWeb
-      for _ in $(seq 1 50); do curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 0.1; done
-    }
+    ensure_app
     case "$sub" in
       on|off)
         out="$(api /default-browser "$(jq -nc --argjson on "$([ "$sub" = on ] && echo true || echo false)" '{on:$on}')" 120)"

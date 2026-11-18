@@ -3,19 +3,33 @@
 # view over this pane's body; this process keeps the pane alive, re-registers
 # the panel if RexWeb restarts, and closes the panel when the pane goes away.
 set -u
+PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
-port="${REXWEB_PORT:-18802}"
+cfg="$HOME/.rexweb/config.json"
+port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
 id="${REX_BLOCK:?rexweb-pane must run inside a Rex pane}"
 session="${REX_SESSION:?rexweb-pane must run inside a Rex pane}"
 focus="${REXWEB_FOCUS:-false}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-post() { curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' -d "$2"; }
+command -v jq >/dev/null 2>&1 || { printf '  rexweb needs jq. Install it with: brew install jq\n'; sleep 3600; exit 1; }
+
+post() {
+  curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
+    -H "x-rexweb-token: $(cat "$HOME/.rexweb/token" 2>/dev/null)" -d "$2"
+}
+
+shown=""
+show() {
+  [ "$1" = "$shown" ] && return
+  shown="$1"
+  printf '\033[?25l\033[2J\033[H\033[2m  %s\033[0m\n' "$1"
+}
 
 app_path() {
   if [ -n "${REXWEB_APP:-}" ]; then echo "$REXWEB_APP"; return; fi
-  case "$here" in */RexWeb.app/Contents/Resources) echo "${here%/Contents/Resources}"; return ;; esac
-  for a in "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app" "$here/../build/RexWeb.app"; do
+  case "$here" in */RexWeb.app/Contents/Resources) [ -d "${here%/Contents/Resources}" ] && { echo "${here%/Contents/Resources}"; return; } ;; esac
+  for a in "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app"; do
     [ -d "$a" ] && { echo "$a"; return; }
   done
 }
@@ -23,31 +37,48 @@ app_path() {
 ensure_app() {
   post /health '{}' 1 >/dev/null && return 0
   local app; app="$(app_path)"
-  [ -n "$app" ] || { echo "RexWeb.app not found; run make install in the rexweb repo"; return 1; }
+  [ -n "$app" ] || return 2
+  show "rexweb · starting RexWeb…"
   open -g "$app"
   for _ in $(seq 1 50); do post /health '{}' 1 >/dev/null && return 0; sleep 0.1; done
+  show "rexweb · RexWeb didn't start. Run: rexweb doctor"
   return 1
 }
 
 register() {
-  post /register "$(jq -nc --arg id "$id" --arg s "$session" --arg u "$url" --argjson f "$focus" \
-    '{id:$id, session:$s, url:$u, focus:$f}')" >/dev/null
+  local out
+  out="$(post /register "$(jq -nc --arg id "$id" --arg s "$session" --arg u "$url" --argjson f "$focus" \
+    '{id:$id, session:$s, url:$u, focus:$f}')")"
+  if jq -e '.id' >/dev/null 2>&1 <<<"$out"; then
+    show "rexweb · ${url:-blank}"
+  else
+    show "rexweb · couldn't register: $(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null). Run: rexweb doctor"
+  fi
+}
+
+connect() {
+  ensure_app
+  case $? in
+    0) register ;;
+    2) show "rexweb · RexWeb.app isn't installed. Close this pane, or run ./install.sh"; missing=$((missing + 1)) ;;
+  esac
 }
 
 cleanup() { post /close "$(jq -nc --arg id "$id" '{id:$id}')" 1 >/dev/null; exit 0; }
 trap cleanup EXIT HUP INT TERM
 
-printf '\033[?25l\033[2J\033[H\033[2m  rexweb · %s\033[0m\n' "${url:-blank}"
-ensure_app && register
+missing=0
+show "rexweb · ${url:-blank}"
+connect
 focus=false
 
-# Heartbeat: remember the current URL, and bring the panel back if RexWeb restarted.
-while true; do
+while [ "$missing" -lt 30 ]; do
   sleep 2 & wait $!
   info="$(post /info "$(jq -nc --arg id "$id" '{id:$id}')" 2)"
-  if [ -n "$info" ] && cur="$(jq -er '.url // empty' <<<"$info" 2>/dev/null)"; then
-    url="$cur"
+  if cur="$(jq -er '.url // empty' <<<"$info" 2>/dev/null)"; then
+    url="$cur"; missing=0
+    show "rexweb · $url"
   elif ! jq -e '.id' <<<"$info" >/dev/null 2>&1; then
-    ensure_app && register
+    connect
   fi
 done
