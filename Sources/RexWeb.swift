@@ -610,6 +610,8 @@ final class Tracker {
   var views: [String: [String: Any]] = [:]
   var displayed: [String: Bool] = [:]
   var grids: [String: Rex.Grid] = [:]
+  var windowSession: [Int: String] = [:]
+  var pendingPair: (Int, String)?
   var refreshing = Set<String>()
   var dirty = Set<String>()
   var eventsProcess: Process?
@@ -618,7 +620,10 @@ final class Tracker {
 
   func start() {
     Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
-    Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.insets = RexChrome.read() }
+    Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+      self?.insets = RexChrome.read()
+      self?.learnWindows()
+    }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
     startEvents()
   }
@@ -755,20 +760,9 @@ final class Tracker {
 
     for p in panels {
       guard displayed[p.id] == true, let v = views[p.session], let place = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
-      let label = v["label"] as? String ?? ""
       let ins = insets
       let frac = place.rect
-      var rw = rexWins.first(where: { $0.name == label || $0.name.hasSuffix(" - \(label)") })
-      if rw == nil, rexWins.count == 1 { rw = rexWins[0] }
-      if rw == nil, rexWins.count > 1, let g = grids[p.id] {
-        let scored = rexWins.map { w -> (RexWindow, Double) in
-          let body = Tracker.body(frac, floating: place.floating, in: w.bounds, ins).body
-          let s = Tracker.scale(at: w.bounds, primaryHeight: primaryHeight)
-          return (w, abs(body.width - g.columns * g.cellWidth / s) + abs(body.height - g.rows * g.cellHeight / s))
-        }
-        if let best = scored.min(by: { $0.1 < $1.1 }) { rw = best.0 }
-      }
-      guard let rw else { hide(p); continue }
+      guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
 
       let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
       if key != p.layoutKey {
@@ -806,6 +800,38 @@ final class Tracker {
       p.focusedInRex = isFocused
     }
     rexWasActive = rexActive
+  }
+
+  func learnWindows() {
+    let wins = Tracker.rexWindows().rex
+    let live = Set(wins.map(\.number))
+    windowSession = windowSession.filter { live.contains($0.key) }
+    let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
+    guard rexActive, let front = wins.first,
+          let data = RexChrome.value("lastFocusedSession") as? Data,
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let session = o["sessionID"] as? String else { pendingPair = nil; return }
+    if let p = pendingPair, p.0 == front.number, p.1 == session {
+      windowSession = windowSession.filter { $0.value != session }
+      windowSession[front.number] = session
+    }
+    pendingPair = (front.number, session)
+  }
+
+  func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
+    let label = v["label"] as? String ?? ""
+    if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
+    if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
+    let free = rexWins.filter { windowSession[$0.number] == nil }
+    if free.count == 1 { return free[0] }
+    guard free.count > 1, let g = grids[p.id] else { return nil }
+    let ranked = free.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
+    return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
+    func score(_ w: RexWindow) -> Double {
+      let body = Tracker.body(place.rect, floating: place.floating, in: w.bounds, insets).body
+      let s = Tracker.scale(at: w.bounds, primaryHeight: primaryHeight)
+      return abs(body.width - g.columns * g.cellWidth / s) + abs(body.height - g.rows * g.cellHeight / s)
+    }
   }
 
   static func body(_ frac: CGRect, floating: Bool, in b: CGRect, _ ins: Insets) -> (body: CGRect, radius: Double) {
@@ -951,8 +977,12 @@ enum JS {
   if (!el) return { error: 'no element for ' + t };
   el.focus();
   if (el.isContentEditable) {
-    if (args.clear) { document.execCommand('selectAll'); document.execCommand('delete'); }
-    document.execCommand('insertText', false, args.text);
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    if (args.clear) { document.execCommand('delete'); } else { sel.collapseToEnd(); }
+    return { native: true };
   } else {
     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
     const set = Object.getOwnPropertyDescriptor(proto, 'value').set;
@@ -1319,6 +1349,11 @@ final class App: NSObject, NSApplicationDelegate {
                      "clear": input["clear"] as? Bool ?? false, "submit": input["submit"] as? Bool ?? false]) { v, e in
         guard e == nil else { return fail(e!) }
         if let d = v as? [String: Any], let err = d["error"] as? String { return fail(err) }
+        if let d = v as? [String: Any], d["native"] as? Bool == true {
+          p.window.makeFirstResponder(p.web)
+          p.web.insertText(input["text"] as? String ?? "")
+          if input["submit"] as? Bool == true { _ = self.nativeKey(p, "enter") }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
       }
     case "/press":
