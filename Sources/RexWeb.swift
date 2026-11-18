@@ -10,6 +10,8 @@ struct Config {
   var gap = 8.0, header = 36.0, radius = 10.0
   var port = 18802
   var searchURL = "https://www.google.com/search?q=%s"
+  var fallbackBrowser = ""
+  var linkTarget = "split"
   var rexBin = "/Applications/Rex Beta.app/Contents/Helpers/Rex Server.rex/Contents/MacOS/rex"
 
   static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".rexweb")
@@ -26,6 +28,8 @@ struct Config {
     if let p = o["port"] as? NSNumber { c.port = p.intValue }
     if let b = o["rex_bin"] as? String { c.rexBin = b }
     if let u = o["search_url"] as? String, u.contains("%s") { c.searchURL = u }
+    if let f = o["fallback_browser"] as? String { c.fallbackBrowser = f }
+    if let t = o["links"] as? String, ["tab", "split"].contains(t) { c.linkTarget = t }
     return c
   }
 }
@@ -102,6 +106,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   var lastFrame = NSRect.zero
   var lastActive = Date()
   var focusedInRex = false
+  var pendingFocus = false
+  var focusURLWhenShown = false
 
   static let barHeight: CGFloat = 30
   static let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "6F1C0D2A-9C3B-4E55-9B7A-5E3B0AEB0001")!)
@@ -608,7 +614,7 @@ final class Tracker {
     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
 
     for p in panels {
-      guard displayed[p.id] != false, let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
+      guard displayed[p.id] == true, let v = views[p.session], let frac = Tracker.placement(of: p.id, in: v) else { hide(p); continue }
       let label = v["label"] as? String ?? ""
       guard let rw = rexWins.first(where: { $0.name == "Rex - \(label)" || $0.name == label })
               ?? (rexWins.count == 1 ? rexWins[0] : nil) else { hide(p); continue }
@@ -637,6 +643,10 @@ final class Tracker {
       }
       if !p.visible || !stacked { p.window.order(.above, relativeTo: rw.number) }
       p.visible = true
+      if p.pendingFocus {
+        p.pendingFocus = false
+        App.shared.focus(p)
+      }
 
       let isFocused = Tracker.focused(in: v) == p.id
       if isFocused && !p.focusedInRex && rexActive {
@@ -768,11 +778,88 @@ enum JS {
   """#
 }
 
+enum Links {
+  static let fallbackFile = Config.dir.appendingPathComponent("fallback-browser")
+  static let selfID = Bundle.main.bundleIdentifier ?? "dev.coey.rexweb"
+
+  static var fallbackID: String {
+    if !config.fallbackBrowser.isEmpty { return config.fallbackBrowser }
+    if let saved = try? String(contentsOf: fallbackFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+       !saved.isEmpty { return saved }
+    for id in ["com.google.Chrome", "com.apple.Safari"] where NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) != nil {
+      return id
+    }
+    return "com.apple.Safari"
+  }
+
+  static func forward(_ url: URL) {
+    guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: fallbackID) else { return }
+    NSWorkspace.shared.open([url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+  }
+
+  static func frontRexSession() -> String? {
+    guard let win = Tracker.rexWindows().rex.first else { return nil }
+    let label = win.name.hasPrefix("Rex - ") ? String(win.name.dropFirst(6)) : win.name
+    guard let data = Rex.run(["ls", "--json"]),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let sessions = o["sessions"] as? [[String: Any]] else { return nil }
+    return sessions.first { $0["label"] as? String == label }?["session_id"] as? String
+  }
+
+  static func openInRex(_ url: URL) {
+    let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
+    Rex.queue.async {
+      var args = config.linkTarget == "tab" ? ["run"] : ["split", "--split=right"]
+      if let s = frontRexSession() { args += ["-s", s] }
+      args += ["--shell=none", "--label", "browser", "--", "env", "REXWEB_FOCUS=true", pane, url.absoluteString]
+      if Rex.run(args) == nil { DispatchQueue.main.async { forward(url) } }
+    }
+  }
+
+  static func makeDefault(_ on: Bool, done: @escaping (String?) -> Void) {
+    let probe = URL(string: "https://example.com")!
+    let target: URL
+    if on {
+      if let current = NSWorkspace.shared.urlForApplication(toOpen: probe),
+         let id = Bundle(url: current)?.bundleIdentifier, id != selfID {
+        try? id.write(to: fallbackFile, atomically: true, encoding: .utf8)
+      }
+      target = Bundle.main.bundleURL
+    } else {
+      guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: fallbackID) else { return done("no browser to restore") }
+      target = app
+    }
+    let wanted = Bundle(url: target)?.bundleIdentifier
+    let check = { (err: Error?) in
+      DispatchQueue.main.async {
+        let now = ["http", "https"].map { NSWorkspace.shared.urlForApplication(toOpen: URL(string: "\($0)://example.com")!).flatMap { Bundle(url: $0)?.bundleIdentifier } }
+        done(now.allSatisfy { $0 == wanted } ? nil : (err?.localizedDescription ?? "macOS didn't change the default browser"))
+      }
+    }
+    NSWorkspace.shared.setDefaultApplication(at: target, toOpenURLsWithScheme: "http") { _ in
+      NSWorkspace.shared.setDefaultApplication(at: target, toOpenURLsWithScheme: "https") { check($0) }
+    }
+  }
+}
+
 final class App: NSObject, NSApplicationDelegate {
   static let shared = App()
   var panels: [String: Panel] = [:]
   let tracker = Tracker()
   let server = Server()
+
+  func applicationWillFinishLaunching(_ n: Notification) {
+    NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURLEvent(_:reply:)),
+                                                 forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+  }
+
+  @objc func handleURLEvent(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+    guard let raw = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue, let url = URL(string: raw) else { return }
+    let pid = event.attributeDescriptor(forKeyword: keySenderPIDAttr)?.int32Value ?? 0
+    let sender = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+    log("link from \(sender.isEmpty ? "pid \(pid)" : sender)")
+    if sender.hasPrefix("com.superlogical.rex") { Links.openInRex(url) } else { Links.forward(url) }
+  }
 
   func applicationDidFinishLaunching(_ n: Notification) {
     try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
@@ -842,9 +929,11 @@ final class App: NSObject, NSApplicationDelegate {
 
   func focus(_ p: Panel) {
     p.lastActive = Date()
+    guard p.visible else { p.pendingFocus = true; return }
     NSApp.activate(ignoringOtherApps: true)
-    p.window.makeKeyAndOrderFront(nil)
+    p.window.makeKey()
     p.window.makeFirstResponder(p.web)
+    if p.focusURLWhenShown { p.focusURLWhenShown = false; p.focusURL() }
   }
 
   func closePanel(_ id: String) {
@@ -894,10 +983,8 @@ final class App: NSObject, NSApplicationDelegate {
       log("pane \(id.suffix(6)) registered")
       let url = input["url"] as? String ?? ""
       if input["focus"] as? Bool == true {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-          self.focus(p)
-          if url.isEmpty { p.focusURL() }
-        }
+        p.focusURLWhenShown = url.isEmpty
+        self.focus(p)
       }
       return ok(p.info())
     case "/close":
@@ -919,6 +1006,15 @@ final class App: NSObject, NSApplicationDelegate {
         }
       }
       group.notify(queue: .main) { ok(["set": n]) }
+      return
+    case "/links":
+      let current = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!).flatMap { Bundle(url: $0)?.bundleIdentifier } ?? ""
+      return ok(["default": current, "on": current == Links.selfID, "fallback": Links.fallbackID])
+    case "/default-browser":
+      let on = input["on"] as? Bool ?? true
+      Links.makeDefault(on) { err in
+        err == nil ? ok(["default": on ? Links.selfID : Links.fallbackID, "fallback": Links.fallbackID]) : fail(err!)
+      }
       return
     case "/cookies/import":
       let domains = input["domains"] as? [String] ?? []

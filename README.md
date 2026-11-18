@@ -26,7 +26,7 @@ palette. From a shell:
 
 ```sh
 rexweb open localhost:3000
-rexweb open docs.rs --split=below --ratio 40
+rexweb open docs.rs --split=below
 rexweb open --tab github.com
 ```
 
@@ -43,6 +43,18 @@ move it to another tab, or close it. Its header shows the page's title.
 | `Ctrl-Opt-Arrow` | Back to the Rex pane in that direction |
 
 Right-click and choose **Inspect Element** for Web Inspector.
+
+### Open Rex's links in Rex
+
+```sh
+rexweb links on
+```
+
+Links you click in Rex now open in a browser pane beside the pane you clicked
+in. Links from every other app,
+and from `open` in a shell, still go to the browser you had before. This works
+by making RexWeb your default browser, which checks where each link came from
+and passes the rest on. `rexweb links off` puts your old browser back.
 
 ## Drive it from scripts and agents
 
@@ -110,8 +122,9 @@ require("rexweb").setup{
 }
 ```
 
-`~/.rexweb/config.json` can set `search_url` (with `%s` for the query) and
-`port`. If a pane ever sits a few points off, `top`, `left`, `right`,
+`~/.rexweb/config.json` can set `search_url` (with `%s` for the query),
+`links` (`"split"`, the default, or `"tab"`), `fallback_browser` (a bundle ID such as
+`com.apple.Safari`), and `port`. If a pane ever sits a few points off, `top`, `left`, `right`,
 `bottom`, `gap`, and `header` adjust the fit.
 
 ## How it works

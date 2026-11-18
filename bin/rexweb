@@ -36,8 +36,9 @@ Automation:
   wait        Wait for an element, some text, or the page to load
   screenshot  Save a PNG of the page
 
-Sign-in:
+Sign-in and links:
   cookies     Import cookies, such as a sign-in from Chrome
+  links       Open links you click in Rex in a browser pane
 
 Options:
   -h, --help  help for rexweb
@@ -259,6 +260,28 @@ Options:
       --reload          reload every browser pane afterward
 EOF
     ;;
+    links) cat <<'EOF'
+Open links you click in Rex in a browser pane beside the pane you clicked in,
+and every other link in your usual browser.
+
+"links on" makes RexWeb your default browser. It opens links from Rex itself
+and passes every other link straight to the browser you had before, so links
+from other apps, and from "open" in a shell, behave as they did. macOS asks you
+to confirm the change. "links off" makes your previous browser the default
+again.
+
+Commands:
+  on          Route links clicked in Rex to browser panes
+  off         Make your previous browser the default again
+  status      Print the default browser and where other links go
+
+Usage:
+  rexweb links on|off|status
+
+Set "links": "tab" in ~/.rexweb/config.json to open them in a new tab instead, and "fallback_browser" to a bundle ID, such as
+"com.apple.Safari", to choose where other links go.
+EOF
+    ;;
     *) help_root ;;
   esac
 }
@@ -477,6 +500,32 @@ case "$cmd" in
         ;;
       ""|-h|--help|help) help_cmd cookies ;;
       *) die "unknown cookies command \"$sub\". Run \"rexweb cookies --help\"." ;;
+    esac
+    ;;
+
+  links)
+    sub="${1:-status}"
+    case "$sub" in
+      -h|--help|help) help_cmd links; exit 0 ;;
+    esac
+    curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 || {
+      open -g "$HOME/Applications/RexWeb.app" 2>/dev/null || open -g -a RexWeb
+      for _ in $(seq 1 50); do curl -s -m 1 -X POST "http://127.0.0.1:$port/health" >/dev/null 2>&1 && break; sleep 0.1; done
+    }
+    case "$sub" in
+      on|off)
+        out="$(api /default-browser "$(jq -nc --argjson on "$([ "$sub" = on ] && echo true || echo false)" '{on:$on}')" 120)"
+        if [ "$sub" = on ]; then
+          jq -r '"Links you click in Rex now open in browser panes. Other links open in \(.fallback)."' <<<"$out"
+        else
+          jq -r '"\(.default) is your default browser again."' <<<"$out"
+        fi
+        ;;
+      status)
+        api /links '{}' | jq -r 'if .on then "On: links clicked in Rex open in browser panes, other links open in \(.fallback)."
+          else "Off: \(.default) opens every link. Run \"rexweb links on\" to change that." end'
+        ;;
+      *) die "unknown links command \"$sub\". Run \"rexweb links --help\"." ;;
     esac
     ;;
 
