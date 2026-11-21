@@ -9,6 +9,12 @@ bindir="${PREFIX:-$HOME/.local}/bin"
 
 fail() { echo "rexweb: $*" >&2; exit 1; }
 
+# --with-chromium also builds RexWebChromium.app, the optional Chromium engine.
+with_chromium=0
+for arg in "$@"; do
+  case "$arg" in --with-chromium) with_chromium=1 ;; esac
+done
+
 [ "$(uname -s)" = Darwin ] || fail "rexweb runs on macOS only."
 major="$(sw_vers -productVersion | cut -d. -f1)"
 [ "$major" -ge 14 ] || fail "rexweb needs macOS 14 or later. This Mac has $(sw_vers -productVersion)."
@@ -18,6 +24,11 @@ command -v jq >/dev/null 2>&1 || fail "rexweb needs jq. Run: brew install jq"
 command -v rex >/dev/null 2>&1 || fail "rexweb needs Rex and its rex command: https://www.superlogical.com/rex/docs/installation"
 rex_bin="$(command -v rex)"
 rex version >/dev/null 2>&1 || fail "$rex_bin doesn't run. Check your Rex install."
+if [ "$with_chromium" = 1 ]; then
+  [ "$major" -ge 15 ] || fail "the Chromium engine needs macOS 15 or later. This Mac has $(sw_vers -productVersion). Run ./install.sh without --with-chromium."
+  swift package --version >/dev/null 2>&1 ||
+    fail "the Chromium engine needs the Swift Package Manager from full Xcode. Install Xcode, run: sudo xcode-select -s /Applications/Xcode.app, then run ./install.sh --with-chromium again."
+fi
 
 echo "building RexWeb.app"
 make -C "$here" install APPDIR="$appdir" PREFIX="$(dirname "$bindir")" >/dev/null
@@ -48,6 +59,13 @@ if ! grep -Eqs "require[[:space:]]*\(?[\"']rexweb[\"']" "$config_file"; then
 fi
 rex config reload >/dev/null 2>&1 || echo "warning: rex config reload failed. Check $config_file with: rex config check" >&2
 
+if [ "$with_chromium" = 1 ]; then
+  echo "building RexWebChromium.app. The first build downloads Chromium (CEF, about 134 MB)"
+  echo "from cef-builds.spotifycdn.com. The installed app takes about 290 MB."
+  make -C "$here" install-chromium APPDIR="$appdir" ||
+    fail "RexWeb.app is installed, but RexWebChromium.app didn't build. Fix the error above, then run ./install.sh --with-chromium again."
+fi
+
 echo
 case ":$PATH:" in
   *":$bindir:"*) "$bindir/rexweb" doctor || true ;;
@@ -61,3 +79,6 @@ case ":$PATH:" in
 esac
 echo
 echo "rexweb is installed. Press Shift-Cmd-B in Rex, or run: rexweb open example.com"
+if [ "$with_chromium" = 1 ]; then
+  echo "For a Chromium pane, run: rexweb open --engine chromium example.com"
+fi

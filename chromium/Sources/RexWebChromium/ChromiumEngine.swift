@@ -35,6 +35,8 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   var networkSeq = 0
   var networkDropped = 0
   var requestSeq: [String: Int] = [:]
+  /// Changes that arrived before their request did, as a blocked request's failure can.
+  var early: [String: [(inout [String: Any]) -> Void]] = [:]
 
   var view: NSView { host }
   var url: URL? { page.url }
@@ -97,6 +99,24 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     pendingLoadUntil = Date().addingTimeInterval(1.5)
   }
 
+  /// Cmd-click opens a pane beside this one, a sized popup (such as a
+  /// sign-in window) opens natively so it keeps its opener, and any other
+  /// new-window request loads in this pane, as WebKit panes do.
+  func page(_ page: CefPage, decideWindowOpenFor request: CefWindowOpenRequest) -> CefWindowOpenDecision {
+    switch request.disposition {
+    case .newBackgroundTab:
+      guard let url = request.targetURL else { return .deny }
+      panel?.openBeside(url.absoluteString)
+      return .handled
+    case .newPopup:
+      return request.hasUserGesture ? .allowNativePopup : .default(for: request)
+    case .newForegroundTab, .newWindow:
+      return request.hasUserGesture && request.targetURL != nil ? .openInCurrentPage : .default(for: request)
+    default:
+      return .default(for: request)
+    }
+  }
+
   func load(_ url: URL) { expectLoad(); _ = page.load(url) }
   func goBack() { if page.canGoBack { expectLoad() }; page.goBack() }
   func goForward() { if page.canGoForward { expectLoad() }; page.goForward() }
@@ -130,10 +150,11 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     on("Network.loadingFailed") { [weak self] e in
       self?.update(e["requestId"].stringValue) {
         $0["done"] = true
-        var why = e["errorText"].stringValue ?? "failed"
-        if let b = e["blockedReason"].stringValue { why += " (blocked: \(b))" }
-        if let c = e["corsErrorStatus"]["corsError"].stringValue { why += " (CORS: \(c))" }
-        $0["error"] = why
+        var why: [String] = []
+        if let t = e["errorText"].stringValue, !t.isEmpty { why.append(t) }
+        if let b = e["blockedReason"].stringValue { why.append("blocked: \(b)") }
+        if let c = e["corsErrorStatus"]["corsError"].stringValue { why.append("CORS: \(c)") }
+        $0["error"] = why.isEmpty ? "failed" : why.joined(separator: ", ")
         if e["canceled"].boolValue == true { $0["canceled"] = true }
       }
     }
@@ -196,6 +217,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
       "url": String((e["request"]["url"].stringValue ?? "").prefix(2000)), "type": (e["type"].stringValue ?? "other").lowercased(),
       "done": false,
     ])
+    if let changes = early.removeValue(forKey: id) { for c in changes { c(&network[network.count - 1]) } }
     if network.count > ChromiumEngine.networkLimit {
       let extra = network.count - ChromiumEngine.networkLimit
       networkDropped += extra
@@ -207,8 +229,14 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     }
   }
 
-  func update(_ id: String?, _ change: (inout [String: Any]) -> Void) {
-    guard let id, let seq = requestSeq[id], let first = network.first?["seq"] as? Int, seq >= first, seq - first < network.count else { return }
+  func update(_ id: String?, _ change: @escaping (inout [String: Any]) -> Void) {
+    guard let id else { return }
+    guard let seq = requestSeq[id] else {
+      if early.count > 200 { early.removeAll() }
+      early[id, default: []].append(change)
+      return
+    }
+    guard let first = network.first?["seq"] as? Int, seq >= first, seq - first < network.count else { return }
     change(&network[seq - first])
   }
 
@@ -297,7 +325,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
       }
       if let limit = (input["limit"] as? NSNumber)?.intValue, limit > 0, rows.count > limit { rows = Array(rows.suffix(limit)) }
       let result: [String: Any] = ["requests": rows, "last": networkSeq, "dropped": networkDropped]
-      if input["clear"] as? Bool == true { network = []; requestSeq = [:] }
+      if input["clear"] as? Bool == true { network = []; requestSeq = [:]; early = [:] }
       reply(200, result)
       return true
     case "/devtools":

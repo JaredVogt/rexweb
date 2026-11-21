@@ -6,7 +6,7 @@ set -u
 PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
 cfg="$HOME/.rexweb/config.json"
-engine="${REXWEB_ENGINE:-webkit}"
+engine="${REXWEB_ENGINE:-$(jq -r '.engine // "webkit"' "$cfg" 2>/dev/null || echo webkit)}"
 appname="RexWeb"
 if [ "$engine" = chromium ]; then
   appname="RexWebChromium"

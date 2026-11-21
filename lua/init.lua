@@ -1,4 +1,4 @@
--- rexweb: native WebKit browser panes for Rex.
+-- rexweb: native browser panes for Rex, on WebKit or Chromium.
 --
 -- Add this to ~/.config/rex/init.lua:
 --
@@ -11,7 +11,10 @@
 --     split = "right",       -- right, left, above, or below
 --     ratio = 0.5,           -- the share of the split the browser pane gets
 --     home = "",             -- the page a new pane opens; empty focuses the address bar
+--     engine = nil,          -- "webkit" or "chromium"; nil leaves the choice to rexweb-pane
 --   }
+--
+-- engine = "chromium" needs RexWebChromium.app (./install.sh --with-chromium).
 
 local M = {}
 
@@ -35,11 +38,15 @@ local placement = {
   above = { direction = "vertical", side = "before" },
 }
 
-local function pane_block(url)
+local function pane_block(url, engine)
+  local command = { "env", "REXWEB_FOCUS=true" }
+  if engine ~= nil then command[#command + 1] = "REXWEB_ENGINE=" .. engine end
+  command[#command + 1] = PANE
+  command[#command + 1] = url or ""
   return rex.layout.block{
     flavor = SHELL,
     label = "browser",
-    options = { command = { "env", "REXWEB_FOCUS=true", PANE, url or "" } },
+    options = { command = command },
   }
 end
 
@@ -52,13 +59,16 @@ function M.setup(opts)
   if where == nil then
     error("rexweb: split must be right, left, above, or below, not " .. tostring(opts.split), 0)
   end
+  if opts.engine ~= nil and opts.engine ~= "webkit" and opts.engine ~= "chromium" then
+    error("rexweb: engine must be webkit or chromium, not " .. tostring(opts.engine), 0)
+  end
 
   rex.action{
     name = "rexweb_open",
     title = "Open Browser Pane",
-    description = "Open a WebKit browser pane beside this pane.",
+    description = "Open a browser pane beside this pane.",
     category = "Browser",
-    keywords = "browser web webkit safari url page preview localhost",
+    keywords = "browser web webkit safari chromium chrome url page preview localhost",
     args = { url = "string?" },
     run = function(ctx, args)
       local split, err = rex.session.new_split{
@@ -67,7 +77,7 @@ function M.setup(opts)
         side = where.side,
         ratio = where.side == "after" and (1 - opts.ratio) or opts.ratio,
         focus = true,
-        layout = pane_block(args.url or opts.home),
+        layout = pane_block(args.url or opts.home, opts.engine),
       }
       if err ~= nil then error(err, 0) end
       return split
@@ -77,12 +87,12 @@ function M.setup(opts)
   rex.action{
     name = "rexweb_open_tab",
     title = "Open Browser Tab",
-    description = "Open a WebKit browser pane in a new tab.",
+    description = "Open a browser pane in a new tab.",
     category = "Browser",
-    keywords = "browser web webkit safari url page tab window",
+    keywords = "browser web webkit safari chromium chrome url page tab window",
     args = { url = "string?" },
     run = function(ctx, args)
-      local w, err = rex.session.new_window{ layout = pane_block(args.url or opts.home) }
+      local w, err = rex.session.new_window{ layout = pane_block(args.url or opts.home, opts.engine) }
       if err ~= nil then error(err, 0) end
       return w
     end,

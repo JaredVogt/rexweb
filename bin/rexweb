@@ -1,5 +1,6 @@
 #!/bin/bash
-# rexweb: native WebKit browser panes for Rex.
+# rexweb: browser panes for Rex. RexWeb.app draws WebKit panes; the optional
+# RexWebChromium.app draws Chromium panes. This CLI talks to both.
 set -eo pipefail
 
 cfg="$HOME/.rexweb/config.json"
@@ -13,7 +14,7 @@ cport="${REXWEB_CHROMIUM_PORT:-$(jq -r '.chromium_port // 18803' "$cfg" 2>/dev/n
 
 help_root() {
   cat <<'EOF'
-Native WebKit browser panes for Rex.
+Native browser panes for Rex, on WebKit or, if you install it, Chromium.
 
 Usage:
   rexweb [command] [flags]
@@ -41,6 +42,8 @@ Automation:
   screenshot  Save a PNG of the page
   console     Print the page's console messages and errors
   html        Print the page's HTML, or one element's
+  network     Print the page's network requests (Chromium panes)
+  devtools    Open Chromium DevTools for a pane (Chromium panes)
 
 Sign-in and links:
   cookies     Import cookies, such as a sign-in from Chrome
@@ -72,6 +75,11 @@ localhost:3000, or words to search for. Without URL, the pane opens with the
 address bar focused. By default the new pane goes to the right of the current
 pane and takes focus.
 
+Panes use WebKit unless you pass --engine chromium or set "engine": "chromium"
+in ~/.rexweb/config.json. Chromium panes need RexWebChromium.app, which
+"./install.sh --with-chromium" builds. Every other command finds the pane's
+engine by itself.
+
 open prints the new pane's block ID, then waits for the page to load. If the
 page doesn't load, it still prints the ID, writes the error to stderr, and
 exits 1. It warns on stderr if Rex isn't showing the pane.
@@ -81,6 +89,7 @@ Examples:
   rexweb open https://developers.cloudflare.com --split=below --ratio 40
   rexweb open --tab github.com
   rexweb open docs.rs --focus=false
+  rexweb open --engine chromium localhost:3000
 
 Usage:
   rexweb open [URL] [flags]
@@ -91,6 +100,7 @@ Options:
   -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK, then the focused pane)
   -s, --session SESSION  open in SESSION (defaults to REX_SESSION)
       --tab              open the pane in a new tab instead of a split
+      --engine ENGINE    draw the page with ENGINE (webkit or chromium) (default the "engine" key in ~/.rexweb/config.json, else webkit)
       --focus=BOOL       focus the new pane (default true)
       --no-wait          print the ID without waiting for the page to load
       --json             output the result as JSON: {id, session, url, title, loading, visible, error}
@@ -100,6 +110,10 @@ EOF
 Check that rexweb is installed and working, and print what to fix.
 
 Each check prints "ok" or "FAIL". doctor exits 1 if any check fails.
+
+doctor checks RexWebChromium.app only if it is installed, and checks that it
+answers only if it is running. A missing or stopped Chromium app isn't a
+failure.
 
 Usage:
   rexweb doctor [flags]
@@ -300,8 +314,59 @@ Options:
       --clear         forget the pane's messages after printing them
       --json          output {messages, last, dropped} as JSON
 
-The browser's own messages, such as why a CORS request was refused, and
-network traffic aren't captured.
+WebKit panes don't capture the browser's own messages, such as why a CORS
+request was refused. Chromium panes do: those lines start with their origin in
+brackets, such as [network] or [security]. For network traffic, use
+"rexweb network" on a Chromium pane.
+EOF
+    ;;
+    network|net) cat <<'EOF'
+Print the requests a Chromium pane's pages made, oldest first.
+
+Each pane keeps its last 1000 requests. Each line has the request's number,
+its HTTP status, its method, its resource type, and its URL. The status is ERR
+for a request that failed, followed by the reason in parentheses, such as a
+CORS or blocked-request reason. It is ... for a request still in flight.
+Headers and bodies aren't captured.
+
+Pass the last number you saw to --since to print only what came after it.
+
+network works on Chromium panes only. Open one with
+"rexweb open --engine chromium URL".
+
+Examples:
+  rexweb network
+  rexweb network --failed
+  n=$(rexweb network --json | jq .last); rexweb click e3; rexweb network --since "$n"
+
+Usage:
+  rexweb network [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --since N      print only requests numbered above N
+      --limit N      print only the newest N requests
+      --failed       print only requests that failed or got a status of 400 or above
+      --clear        forget the pane's requests after printing them
+      --json         output {requests, last, dropped} as JSON; each request has seq, time, method, url, type, done, and, once known, status, mime, bytes, cached, error, canceled
+EOF
+    ;;
+    devtools) cat <<'EOF'
+Open Chromium DevTools for a Chromium pane. "devtools close" closes it.
+
+devtools works on Chromium panes only. Open one with
+"rexweb open --engine chromium URL". In a WebKit pane, right-click and choose
+Inspect Element instead.
+
+To drive panes with your own Chrome DevTools Protocol client, set
+"chromium_debug_port" in ~/.rexweb/config.json and restart RexWebChromium.
+Anything on this Mac that can reach that port controls every Chromium pane.
+
+Usage:
+  rexweb devtools [close] [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
 EOF
     ;;
     html) cat <<'EOF'
@@ -319,7 +384,8 @@ Options:
 EOF
     ;;
     cookies) cat <<'EOF'
-Import cookies into rexweb's browser profile, which every browser pane shares.
+Import cookies into a rexweb browser profile. WebKit panes share one profile
+and Chromium panes share another, so import into the engine you browse with.
 
 Sites that sign in with a passkey or security key can't do that in rexweb: macOS
 only offers passkeys to browsers Apple has approved. Sign in with Chrome
@@ -333,13 +399,15 @@ Commands:
 Examples:
   rexweb cookies import --domain example.com --domain idp.example.com
   rexweb cookies import --reload
+  rexweb cookies import --engine chromium --domain example.com
   rexweb cookies set cookies.json
 
 Usage:
   rexweb cookies import [flags]
-  rexweb cookies set FILE
+  rexweb cookies set FILE [--engine ENGINE]
 
 Options:
+      --engine ENGINE   import into ENGINE's profile (webkit or chromium) (default the "engine" key in ~/.rexweb/config.json, else webkit)
       --domain DOMAIN   import only cookies for DOMAIN and its subdomains (repeatable; default all)
       --profile NAME    read Chrome profile NAME, such as "Profile 1" (default the most recently used)
       --reload          reload every browser pane afterward
@@ -354,6 +422,9 @@ and passes every other link straight to the browser you had before, so links
 from other apps, and from "open" in a shell, behave as they did. macOS asks you
 to confirm the change, so someone must be at the screen. "links off" makes your
 previous browser the default again.
+
+RexWeb.app is the default browser even if you use Chromium panes. It opens
+links in the engine that "engine" in ~/.rexweb/config.json names.
 
 Commands:
   on          Route links clicked in Rex to browser panes
@@ -533,6 +604,23 @@ case "$cmd" in
       if [ -n "$(token)" ] && raw /list >/dev/null 2>&1 && jq -e '.panels' >/dev/null 2>&1 <<<"$(raw /list)"; then check 1 token "the CLI can talk to RexWeb"
       else check 0 token "RexWeb refused the CLI's token. Restart it: pkill -x RexWeb"; fi
     else check 0 running "RexWeb isn't answering on 127.0.0.1:$port. Run: pkill -x RexWeb, then rexweb doctor"; fi
+    # RexWebChromium.app is optional: no checks unless it is installed, and
+    # none of the server unless it is running.
+    capp="$(app_path chromium)"
+    if [ -n "$capp" ]; then
+      if ! pgrep -x RexWebChromium >/dev/null 2>&1; then
+        check 1 chromium-app "$capp (not running; it starts when you open a Chromium pane)"
+      else
+        check 1 chromium-app "$capp"
+        ch="$(port="$cport" raw /health '{}' 3 2>/dev/null || true)"
+        if [ "$(jq -r '.engine // empty' <<<"$ch" 2>/dev/null)" = chromium ]; then
+          check 1 chromium-run "RexWebChromium $(jq -r .version <<<"$ch") on 127.0.0.1:$cport, $(jq -r .panels <<<"$ch") panes"
+          if [ -n "$(token)" ] && jq -e '.panels' >/dev/null 2>&1 <<<"$(port="$cport" raw /list '{}' 3 2>/dev/null || true)"; then
+            check 1 chromium-token "the CLI can talk to RexWebChromium"
+          else check 0 chromium-token "RexWebChromium refused the CLI's token. Restart it: pkill -x RexWebChromium"; fi
+        else check 0 chromium-run "RexWebChromium is running but isn't answering on 127.0.0.1:$cport. Run: pkill -x RexWebChromium, then rexweb doctor"; fi
+      fi
+    fi
     if [ "$json" = 1 ]; then printf '%s\n' "${checks[@]}" | jq -s --argjson f "$failed" '{ok: ($f == 0), checks: .}'; fi
     exit "$failed"
     ;;
@@ -806,6 +894,7 @@ case "$cmd" in
           case "$1" in
             --engine) need $# "$1"; engine="$2"; shift 2 ;;
             --engine=*) engine="${1#*=}"; shift ;;
+            -h|--help) help_cmd cookies; exit 0 ;;
             *) file="$1"; shift ;;
           esac
         done

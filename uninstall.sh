@@ -30,6 +30,8 @@ rex config reload >/dev/null 2>&1 || true
 if [ "${1:-}" = "--purge" ]; then
   rm -rf "$HOME/.rexweb" "$HOME/Library/WebKit/dev.coey.rexweb" "$HOME/Library/Caches/dev.coey.rexweb" \
     "$HOME/Library/HTTPStorages/dev.coey.rexweb" "$HOME/Library/Saved Application State/dev.coey.rexweb.savedState"
+  rm -rf "$HOME/Library/Application Support/dev.coey.rexweb.chromium" "$HOME/Library/Caches/dev.coey.rexweb.chromium" \
+    "$HOME/Library/HTTPStorages/dev.coey.rexweb.chromium" "$HOME/Library/Saved Application State/dev.coey.rexweb.chromium.savedState"
   rm -f "$config_file.before-rexweb"
   echo "removed rexweb, its settings, and its cookies and site data"
 else
