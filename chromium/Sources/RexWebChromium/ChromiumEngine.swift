@@ -89,6 +89,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   }
 
   func page(_ page: CefPage, didFinishLoadWithStatus httpStatus: Int) {
+    emulateFocus()
     if awaiting && !page.isLoading { finish() }
   }
 
@@ -177,6 +178,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
         do { _ = try await self.page.devTools.send("\(domain).enable") }
         catch { log("\(domain).enable failed: \(error)") }
       }
+      self.emulateFocus()
       self.ready = true
       if let url = self.queued {
         self.queued = nil
@@ -290,10 +292,10 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
 
   func click(x: Double, y: Double) {
     let z = zoom
-    for type in ["mouseMoved", "mousePressed", "mouseReleased"] {
-      send("Input.dispatchMouseEvent", ["type": .string(type), "x": .number(x * z), "y": .number(y * z),
-                                        "button": type == "mouseMoved" ? "none" : "left", "clickCount": type == "mouseMoved" ? 0 : 1])
-    }
+    sendInOrder(["mouseMoved", "mousePressed", "mouseReleased"].map { type in
+      ("Input.dispatchMouseEvent", ["type": .string(type), "x": .number(x * z), "y": .number(y * z),
+                                    "button": type == "mouseMoved" ? "none" : "left", "clickCount": type == "mouseMoved" ? 0 : 1])
+    })
   }
 
   func press(_ name: String) -> Bool {
@@ -310,13 +312,28 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     var down: [String: CefJSON] = ["type": k.text == nil ? "rawKeyDown" : "keyDown", "key": .string(k.key), "code": .string(k.code),
                                    "windowsVirtualKeyCode": .number(Double(k.vk)), "nativeVirtualKeyCode": .number(Double(k.vk))]
     if let t = k.text { down["text"] = .string(t) }
-    send("Input.dispatchKeyEvent", .object(down))
-    send("Input.dispatchKeyEvent", ["type": "keyUp", "key": .string(k.key), "code": .string(k.code),
-                                    "windowsVirtualKeyCode": .number(Double(k.vk)), "nativeVirtualKeyCode": .number(Double(k.vk))])
+    sendInOrder([("Input.dispatchKeyEvent", .object(down)),
+                 ("Input.dispatchKeyEvent", ["type": "keyUp", "key": .string(k.key), "code": .string(k.code),
+                                             "windowsVirtualKeyCode": .number(Double(k.vk)), "nativeVirtualKeyCode": .number(Double(k.vk))])])
     return true
   }
 
   func insertText(_ text: String) { send("Input.insertText", ["text": .string(text)]) }
+
+  /// Sends input events one after another. Chromium drops a press and its release when they arrive
+  /// out of order, which separate `send` tasks do not rule out.
+  func sendInOrder(_ steps: [(String, CefJSON)]) {
+    Task { @MainActor [weak self] in
+      for (method, params) in steps {
+        guard let self else { return }
+        do { _ = try await self.page.devTools.send(method, params) } catch { log("\(method) failed: \(error)"); return }
+      }
+    }
+  }
+
+  /// Chromium drops scripted clicks and keys while the page is unfocused, and a pane driven from the
+  /// CLI rarely has the keyboard. Focus emulation makes the page act focused without taking it.
+  func emulateFocus() { send("Emulation.setFocusEmulationEnabled", ["enabled": true]) }
 
   func screenshot(_ done: @escaping (Data?, String?) -> Void) {
     send("Page.captureScreenshot", ["format": "png"]) { reply, err in
