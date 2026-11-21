@@ -6,9 +6,9 @@ ARCH := $(shell uname -m)
 .PHONY: build install uninstall clean
 build: $(APP)
 
-$(APP): Sources/RexWeb.swift Info.plist bin/rexweb-pane bin/rexweb AGENTS.md
+$(APP): $(wildcard Sources/*.swift) Info.plist bin/rexweb-pane bin/rexweb AGENTS.md
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
-	swiftc -O -swift-version 5 -target $(ARCH)-apple-macos14 Sources/RexWeb.swift -o $(APP)/Contents/MacOS/RexWeb
+	swiftc -O -swift-version 5 -target $(ARCH)-apple-macos14 Sources/*.swift -o $(APP)/Contents/MacOS/RexWeb
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp bin/rexweb-pane bin/rexweb AGENTS.md $(APP)/Contents/Resources/
 	codesign --force --sign - $(APP)

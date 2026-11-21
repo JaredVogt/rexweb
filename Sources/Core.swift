@@ -4,12 +4,12 @@ import SQLite3
 import CoreGraphics
 import Network
 import Security
-import WebKit
 
 struct Config {
   var top: Double?, left: Double?, right: Double?, bottom: Double?
   var gap: Double?, header: Double?, radius: Double?
   var port = 18802
+  var chromiumPort = 18803
   var searchURL = "https://www.google.com/search?q=%s"
   var fallbackBrowser = ""
   var linkTarget = "split"
@@ -47,6 +47,7 @@ struct Config {
     c.top = n("top"); c.left = n("left"); c.right = n("right"); c.bottom = n("bottom")
     c.gap = n("gap"); c.header = n("header"); c.radius = n("radius")
     if let p = o["port"] as? NSNumber { c.port = p.intValue }
+    if let p = o["chromium_port"] as? NSNumber { c.chromiumPort = p.intValue }
     if let b = o["rex_bin"] as? String { c.rexBin = b }
     if let u = o["search_url"] as? String {
       if u.contains("%s") { c.searchURL = u } else { c.configError = "search_url needs %s where the query goes" }
@@ -207,21 +208,47 @@ final class OverlayWindow: NSWindow {
   override var canBecomeMain: Bool { true }
 }
 
-final class ConsoleRelay: NSObject, WKScriptMessageHandler {
-  weak var panel: Panel?
 
-  func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-    guard let o = message.body as? [String: Any] else { return }
-    panel?.record(level: o["level"] as? String ?? "log", text: o["text"] as? String ?? "",
-                  url: o["url"] as? String ?? message.frameInfo.request.url?.absoluteString ?? "",
-                  source: o["source"] as? String)
-  }
+/// What a browser engine provides to a pane. RexWeb.app registers WebKit;
+/// RexWebChromium.app registers Chromium. Everything else in this file is
+/// shared by both apps.
+protocol PageEngine: AnyObject {
+  var view: NSView { get }
+  var url: URL? { get }
+  var title: String { get }
+  var isLoading: Bool { get }
+  var canGoBack: Bool { get }
+  var canGoForward: Bool { get }
+  var zoom: Double { get set }
+  func load(_ url: URL)
+  func goBack()
+  func goForward()
+  func reload(fromOrigin: Bool)
+  /// Runs `body` as the body of an async function whose one parameter is `args`.
+  func call(_ body: String, _ args: [String: Any], _ done: @escaping (Any?, String?) -> Void)
+  /// Clicks at a point in CSS pixels from the page's top-left corner.
+  func click(x: Double, y: Double)
+  func press(_ name: String) -> Bool
+  func insertText(_ text: String)
+  /// PNG data of the page as shown.
+  func screenshot(_ done: @escaping (Data?, String?) -> Void)
+  func focus()
+  func close()
 }
 
-final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
+enum Engine {
+  static var name = "webkit"
+  static var label = "WebKit"
+  static var make: (Panel) -> PageEngine = { _ in fatalError("no page engine registered") }
+  static var setCookies: ([HTTPCookie], @escaping () -> Void) -> Void = { _, done in done() }
+  /// Routes only one engine has. Returns false when the route isn't its own.
+  static var route: ((String, Panel, [String: Any], @escaping (Int, Any) -> Void) -> Bool)?
+}
+
+final class Panel: NSObject, NSTextFieldDelegate {
   let id: String
   let session: String
-  let relay = ConsoleRelay()
+  var engine: PageEngine!
   var console: [[String: Any]] = []
   var consoleSeq = 0
   var consoleDropped = 0
@@ -229,7 +256,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   static let consoleLimit = 1000
   static let consoleLevels: Set<String> = ["log", "info", "warn", "error", "debug", "navigation"]
   let window: OverlayWindow
-  let web: WKWebView
   let bar = NSView()
   let urlField = NSTextField()
   let backButton = NSButton()
@@ -249,23 +275,14 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   var focusURLWhenShown = false
 
   static let barHeight: CGFloat = 30
-  static let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: "6F1C0D2A-9C3B-4E55-9B7A-5E3B0AEB0001")!)
 
   init(id: String, session: String) {
     self.id = id
     self.session = session
-    let conf = WKWebViewConfiguration()
-    conf.websiteDataStore = Panel.store
-    conf.userContentController.addUserScript(WKUserScript(source: JS.consoleHook, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-    conf.userContentController.add(relay, name: "rexwebConsole")
-    conf.applicationNameForUserAgent = "Version/26.4 Safari/605.1.15"
-    conf.preferences.isElementFullscreenEnabled = true
-    conf.allowsAirPlayForMediaPlayback = true
-    web = WKWebView(frame: .zero, configuration: conf)
     window = OverlayWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                            styleMask: [.borderless], backing: .buffered, defer: false)
     super.init()
-    relay.panel = self
+    engine = Engine.make(self)
 
     window.isReleasedWhenClosed = false
     window.hasShadow = false
@@ -280,12 +297,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     root.layer?.masksToBounds = true
     root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
     window.contentView = root
-
-    web.navigationDelegate = self
-    web.uiDelegate = self
-    web.isInspectable = true
-    web.allowsBackForwardNavigationGestures = true
-    web.allowsMagnification = true
 
     for (b, sym, tip, sel) in [(backButton, "chevron.left", "Back", #selector(goBack)),
                                (forwardButton, "chevron.right", "Forward", #selector(goForward)),
@@ -310,7 +321,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     bar.addSubview(urlField)
 
     root.addSubview(bar)
-    root.addSubview(web)
+    root.addSubview(engine.view)
     layout()
     NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
       self?.layout()
@@ -320,10 +331,6 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
       self.lastActive = Date()
       Rex.async(["focus", "-s", self.session, self.id])
     }
-    web.addObserver(self, forKeyPath: "title", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "URL", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "canGoBack", options: .new, context: nil)
-    web.addObserver(self, forKeyPath: "canGoForward", options: .new, context: nil)
     updateChrome()
   }
 
@@ -336,20 +343,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     forwardButton.frame = NSRect(x: 30, y: 4, width: 24, height: 22)
     reloadButton.frame = NSRect(x: 54, y: 4, width: 24, height: 22)
     urlField.frame = NSRect(x: 84, y: 4, width: max(40, b.width - 92), height: 22)
-    web.frame = NSRect(x: 0, y: 0, width: b.width, height: max(0, b.height - h))
-  }
-
-  override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-    updateChrome()
+    engine.view.frame = NSRect(x: 0, y: 0, width: b.width, height: max(0, b.height - h))
   }
 
   func updateChrome() {
-    backButton.isEnabled = web.canGoBack
-    forwardButton.isEnabled = web.canGoForward
+    backButton.isEnabled = engine.canGoBack
+    forwardButton.isEnabled = engine.canGoForward
     if window.firstResponder != urlField.currentEditor() {
-      urlField.stringValue = web.url?.absoluteString ?? ""
+      urlField.stringValue = engine.url?.absoluteString ?? ""
     }
-    guard let title = (web.title?.isEmpty == false ? web.title : web.url?.host), !title.isEmpty else { return }
+    guard let title = (engine.title.isEmpty ? engine.url?.host : engine.title), !title.isEmpty else { return }
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
@@ -358,8 +361,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
   }
 
   func info() -> [String: Any] {
-    ["id": id, "session": session, "url": web.url?.absoluteString ?? "", "title": web.title ?? "",
-     "loading": web.isLoading, "visible": visible, "error": orNull(lastError)]
+    ["id": id, "session": session, "url": engine.url?.absoluteString ?? "", "title": engine.title,
+     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name]
   }
 
   static func normalize(_ raw: String) -> URL? {
@@ -379,20 +382,16 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     guard let url = Panel.normalize(raw) else { done?("bad url"); return }
     requested = url
     if let done { loadWaiters.append(done) }
-    if url.isFileURL {
-      web.loadFileURL(url, allowingReadAccessTo: URL(fileURLWithPath: "/"))
-    } else {
-      web.load(URLRequest(url: url))
-    }
+    engine.load(url)
   }
 
   var refusedError: String? {
-    guard let req = requested, req.scheme != "about", web.url == nil || web.url?.absoluteString == "about:blank" else { return nil }
-    return "WebKit didn't load \(req.absoluteString). Its port may be one WebKit blocks"
+    guard let req = requested, req.scheme != "about", engine.url == nil || engine.url?.absoluteString == "about:blank" else { return nil }
+    return "\(Engine.label) didn't load \(req.absoluteString). Its port may be one \(Engine.label) blocks"
   }
 
   func waitForLoad(_ done: @escaping (String?) -> Void) {
-    if !web.isLoading { done(lastError ?? refusedError); return }
+    if !engine.isLoading { done(lastError ?? refusedError); return }
     loadWaiters.append(done)
   }
 
@@ -402,12 +401,12 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     w.forEach { $0(err) }
   }
 
-  @objc func goBack() { web.goBack() }
-  @objc func goForward() { web.goForward() }
-  @objc func reload() { web.reload() }
+  @objc func goBack() { engine.goBack() }
+  @objc func goForward() { engine.goForward() }
+  @objc func reload() { engine.reload(fromOrigin: false) }
   @objc func submitURL() {
     load(urlField.stringValue)
-    window.makeFirstResponder(web)
+    engine.focus()
   }
 
   func focusURL() {
@@ -415,7 +414,12 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     urlField.currentEditor()?.selectAll(nil)
   }
 
+  /// While set, drops the "Script error." that eval's expression-first attempt
+  /// raises when the code turns out to be statements.
+  var probingUntil = Date.distantPast
+
   func record(level: String, text: String, url: String, source: String? = nil) {
+    if level == "error", text == "Uncaught Script error.", Date() < probingUntil { return }
     consoleSeq += 1
     var entry: [String: Any] = [
       "seq": consoleSeq, "time": Date().timeIntervalSince1970,
@@ -430,106 +434,28 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     }
   }
 
-  func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { lastError = nil }
-  func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-    guard webView === web else { return }
-    record(level: "navigation", text: "Navigated to \(webView.url?.absoluteString ?? "")", url: webView.url?.absoluteString ?? "")
-  }
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { lastError = nil; finishWaiters(nil); updateChrome() }
-  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
-  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
+  // Called by the engine.
 
-  func failed(_ error: Error) {
-    let e = error as NSError
-    if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
-    lastError = e.localizedDescription
-    let failing = (e.userInfo[NSURLErrorFailingURLStringErrorKey] as? String) ?? web.url?.absoluteString ?? ""
-    record(level: "error", text: "Page failed to load: \(e.localizedDescription)", url: failing)
+  func engineChanged() { updateChrome() }
+  func engineStarted() { lastError = nil }
+  func engineCommitted() {
+    let u = engine.url?.absoluteString ?? ""
+    record(level: "navigation", text: "Navigated to \(u)", url: u)
+  }
+  func engineFinished() { lastError = nil; finishWaiters(nil); updateChrome() }
+  func engineFailed(_ message: String, url: String) {
+    lastError = message
+    record(level: "error", text: "Page failed to load: \(message)", url: url)
     finishWaiters(lastError)
   }
-
-  var popups: [Popup] = []
-
-  func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-               for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-    let isPopup = windowFeatures.width != nil || windowFeatures.height != nil || navigationAction.navigationType == .other
-    if !isPopup {
-      if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
-      return nil
-    }
-    let popup = Popup(configuration: configuration, features: windowFeatures, parent: window)
-    popup.onClose = { [weak self, weak popup] in self?.popups.removeAll { $0 === popup } }
-    popups.append(popup)
-    return popup.web
-  }
-
-  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
-               decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-    if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
-       navigationAction.navigationType == .linkActivated {
-      App.shared.openPane(beside: id, session: session, url: url.absoluteString)
-      decisionHandler(.cancel)
-      return
-    }
-    decisionHandler(.allow)
-  }
-
-  func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
-               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
-    let a = NSAlert(); a.messageText = message; a.beginSheetModal(for: window) { _ in completionHandler() }
-  }
-
-  func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
-               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
-    let a = NSAlert(); a.messageText = message; a.addButton(withTitle: "OK"); a.addButton(withTitle: "Cancel")
-    a.beginSheetModal(for: window) { completionHandler($0 == .alertFirstButtonReturn) }
-  }
-
-  func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
-               initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
-    let p = NSOpenPanel(); p.allowsMultipleSelection = parameters.allowsMultipleSelection
-    p.canChooseDirectories = parameters.allowsDirectories
-    p.beginSheetModal(for: window) { completionHandler($0 == .OK ? p.urls : nil) }
-  }
+  func openBeside(_ url: String) { App.shared.openPane(beside: id, session: session, url: url) }
 
   func close() {
-    popups.forEach { $0.window.close() }
-    popups = []
     finishWaiters("closed")
-    web.configuration.userContentController.removeScriptMessageHandler(forName: "rexwebConsole")
-    for k in ["title", "URL", "canGoBack", "canGoForward"] { web.removeObserver(self, forKeyPath: k) }
+    engine.close()
     window.orderOut(nil)
     window.close()
   }
-}
-
-final class Popup: NSObject, WKUIDelegate, WKNavigationDelegate, NSWindowDelegate {
-  let web: WKWebView
-  let window: NSWindow
-  var onClose: (() -> Void)?
-
-  init(configuration: WKWebViewConfiguration, features: WKWindowFeatures, parent: NSWindow) {
-    let w = CGFloat(features.width?.doubleValue ?? 520), h = CGFloat(features.height?.doubleValue ?? 680)
-    web = WKWebView(frame: NSRect(x: 0, y: 0, width: w, height: h), configuration: configuration)
-    window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
-                      styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
-    super.init()
-    window.isReleasedWhenClosed = false
-    window.contentView = web
-    window.delegate = self
-    web.uiDelegate = self
-    web.navigationDelegate = self
-    web.isInspectable = true
-    let pf = parent.frame
-    window.setFrameOrigin(NSPoint(x: pf.midX - w / 2, y: pf.midY - h / 2))
-    window.level = .floating
-    window.makeKeyAndOrderFront(nil)
-    NSApp.activate(ignoringOtherApps: true)
-  }
-
-  func webViewDidClose(_ webView: WKWebView) { window.close() }
-  func windowWillClose(_ n: Notification) { onClose?() }
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { window.title = webView.title ?? "" }
 }
 
 enum ChromeCookies {
@@ -1262,17 +1188,17 @@ final class App: NSObject, NSApplicationDelegate {
     if m == .command {
       switch c {
       case "l": p.focusURL(); return true
-      case "r": p.web.reload(); return true
-      case "[": p.web.goBack(); return true
-      case "]": p.web.goForward(); return true
-      case "=", "+": p.web.pageZoom = min(3, p.web.pageZoom + 0.1); return true
-      case "-": p.web.pageZoom = max(0.3, p.web.pageZoom - 0.1); return true
-      case "0": p.web.pageZoom = 1; return true
+      case "r": p.engine.reload(fromOrigin: false); return true
+      case "[": p.engine.goBack(); return true
+      case "]": p.engine.goForward(); return true
+      case "=", "+": p.engine.zoom = min(3, p.engine.zoom + 0.1); return true
+      case "-": p.engine.zoom = max(0.3, p.engine.zoom - 0.1); return true
+      case "0": p.engine.zoom = 1; return true
       case "w": Rex.async(["block", "close", p.id]); return true
       default: break
       }
     }
-    if m == [.command, .shift], c == "r" { p.web.reloadFromOrigin(); return true }
+    if m == [.command, .shift], c == "r" { p.engine.reload(fromOrigin: true); return true }
     if m == [.command, .shift], c == "b" { openPane(beside: p.id, session: p.session, url: ""); return true }
     if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
       let dir: String? = [123: "left", 124: "right", 125: "down", 126: "up"][Int(e.keyCode)]
@@ -1298,7 +1224,7 @@ final class App: NSObject, NSApplicationDelegate {
     guard p.visible else { p.pendingFocus = true; return }
     NSApp.activate(ignoringOtherApps: true)
     p.window.makeKey()
-    p.window.makeFirstResponder(p.web)
+    p.engine.focus()
     if p.focusURLWhenShown { p.focusURLWhenShown = false; p.focusURL() }
   }
 
@@ -1322,12 +1248,7 @@ final class App: NSObject, NSApplicationDelegate {
   }
 
   func js(_ p: Panel, _ body: String, _ args: [String: Any], _ done: @escaping (Any?, String?) -> Void) {
-    p.web.callAsyncJavaScript(body, arguments: ["args": args], in: nil, in: .page) { r in
-      switch r {
-      case .success(let v): done(v, nil)
-      case .failure(let e): done(nil, (e as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String ?? e.localizedDescription)
-      }
-    }
+    p.engine.call(body, args, done)
   }
 
   func handle(path: String, input: [String: Any], reply: @escaping (Int, Any) -> Void) {
@@ -1341,7 +1262,7 @@ final class App: NSObject, NSApplicationDelegate {
       return ok([
         "ok": true, "pid": ProcessInfo.processInfo.processIdentifier, "panels": panels.count,
         "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
-        "port": config.port, "rex_bin": config.rexBin, "rex_version": orNull(Rex.version),
+        "engine": Engine.name, "port": config.port, "rex_bin": config.rexBin, "rex_version": orNull(Rex.version),
         "rex_windows": wins.count,
         "window_names": wins.isEmpty ? NSNull() as Any : wins.contains { !$0.name.isEmpty } as Any,
         "config_error": orNull(config.configError),
@@ -1369,18 +1290,15 @@ final class App: NSObject, NSApplicationDelegate {
     case "/cookies":
       let list = input["cookies"] as? [[String: Any]] ?? []
       var n = 0
-      let group = DispatchGroup()
+      var made: [HTTPCookie] = []
       for item in list {
         var props: [HTTPCookiePropertyKey: Any] = [.name: item["name"] as? String ?? "", .value: item["value"] as? String ?? "",
                                                    .domain: item["domain"] as? String ?? "", .path: item["path"] as? String ?? "/"]
         if item["secure"] as? Bool == true { props[.secure] = "TRUE" }
         if let x = (item["expires"] as? NSNumber)?.doubleValue, x > 0 { props[.expires] = Date(timeIntervalSince1970: x) }
-        if let c = HTTPCookie(properties: props) {
-          group.enter(); n += 1
-          Panel.store.httpCookieStore.setCookie(c) { group.leave() }
-        }
+        if let c = HTTPCookie(properties: props) { made.append(c); n += 1 }
       }
-      group.notify(queue: .main) { ok(["set": n]) }
+      Engine.setCookies(made) { ok(["set": n]) }
       return
     case "/links":
       let current = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!).flatMap { Bundle(url: $0)?.bundleIdentifier } ?? ""
@@ -1398,10 +1316,8 @@ final class App: NSObject, NSApplicationDelegate {
         do {
           let (cookies, skipped) = try ChromeCookies.read(profile: profile, domains: domains)
           DispatchQueue.main.async {
-            let group = DispatchGroup()
-            for c in cookies { group.enter(); Panel.store.httpCookieStore.setCookie(c) { group.leave() } }
-            group.notify(queue: .main) {
-              let reloadIDs = input["reload"] as? Bool == true ? self.panels.values.map { p in p.web.reload(); return p.id } : []
+            Engine.setCookies(cookies) {
+              let reloadIDs = input["reload"] as? Bool == true ? self.panels.values.map { p in p.engine.reload(fromOrigin: false); return p.id } : []
               ok(["imported": cookies.count, "skipped": skipped, "reloaded": reloadIDs])
             }
           }
@@ -1435,12 +1351,12 @@ final class App: NSObject, NSApplicationDelegate {
       var replied = false
       let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30
       DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-        if !replied { replied = true; reply(408, ["error": "the page was still loading after \(Int(timeout))s", "url": p.web.url?.absoluteString ?? ""]) }
+        if !replied { replied = true; reply(408, ["error": "the page was still loading after \(Int(timeout))s", "url": p.engine.url?.absoluteString ?? ""]) }
       }
       p.waitForLoad { err in
         guard !replied else { return }
         replied = true
-        err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": p.web.url?.absoluteString ?? ""])
+        err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": p.engine.url?.absoluteString ?? ""])
       }
     case "/nav", "/open":
       guard let url = input["url"] as? String else { return fail("url required") }
@@ -1449,15 +1365,17 @@ final class App: NSObject, NSApplicationDelegate {
         e == nil ? ok(p.info()) : reply(502, ["error": e!, "url": url])
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-        if !p.web.isLoading, let e = p.refusedError { p.finishWaiters(e) }
+        if !p.engine.isLoading, let e = p.refusedError { p.finishWaiters(e) }
       }
-    case "/back": p.web.goBack(); p.waitForLoad { _ in ok(p.info()) }
-    case "/forward": p.web.goForward(); p.waitForLoad { _ in ok(p.info()) }
-    case "/reload": p.web.reload(); p.waitForLoad { _ in ok(p.info()) }
+    case "/back": p.engine.goBack(); p.waitForLoad { _ in ok(p.info()) }
+    case "/forward": p.engine.goForward(); p.waitForLoad { _ in ok(p.info()) }
+    case "/reload": p.engine.reload(fromOrigin: false); p.waitForLoad { _ in ok(p.info()) }
     case "/focus": focus(p); ok(p.info())
     case "/eval":
       let code = input["js"] as? String ?? ""
+      p.probingUntil = Date().addingTimeInterval(5)
       js(p, JS.evaluate(code, asExpression: true), [:]) { v, e in
+        p.probingUntil = Date().addingTimeInterval(0.3)
         guard let e else { return ok(["value": v ?? NSNull()]) }
         if !e.contains("SyntaxError") && !e.contains("Unexpected") { return fail(e) }
         self.js(p, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
@@ -1491,7 +1409,7 @@ final class App: NSObject, NSApplicationDelegate {
         guard e == nil, let d = v as? [String: Any] else { return fail(e ?? "resolve failed") }
         if let err = d["error"] as? String { return fail(err) }
         let x = (d["x"] as? NSNumber)?.doubleValue ?? 0, y = (d["y"] as? NSNumber)?.doubleValue ?? 0
-        self.nativeClick(p, x: x, y: y)
+        p.engine.click(x: x, y: y)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
       }
     case "/type":
@@ -1500,21 +1418,20 @@ final class App: NSObject, NSApplicationDelegate {
         guard e == nil else { return fail(e!) }
         if let d = v as? [String: Any], let err = d["error"] as? String { return fail(err) }
         if let d = v as? [String: Any], d["native"] as? Bool == true {
-          p.window.makeFirstResponder(p.web)
-          p.web.insertText(input["text"] as? String ?? "")
-          if input["submit"] as? Bool == true { _ = self.nativeKey(p, "enter") }
+          p.engine.focus()
+          p.engine.insertText(input["text"] as? String ?? "")
+          if input["submit"] as? Bool == true { _ = p.engine.press("enter") }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
       }
     case "/press":
       guard let k = input["key"] as? String else { return fail("key required") }
-      if nativeKey(p, k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
+      if p.engine.press(k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
     case "/shot":
       let path = (input["path"] as? String) ?? NSTemporaryDirectory() + "rexweb-\(p.id.suffix(6))-\(Int(Date().timeIntervalSince1970)).png"
       guard path.lowercased().hasSuffix(".png") else { return fail("screenshot path must end in .png") }
-      p.web.takeSnapshot(with: nil) { img, err in
-        guard let img, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]) else { return fail(err?.localizedDescription ?? "snapshot failed") }
+      p.engine.screenshot { png, err in
+        guard let png, let rep = NSBitmapImageRep(data: png) else { return fail(err ?? "snapshot failed") }
         do { try png.write(to: URL(fileURLWithPath: path)); ok(["path": path, "width": rep.pixelsWide, "height": rep.pixelsHigh]) }
         catch { fail(error.localizedDescription) }
       }
@@ -1529,47 +1446,12 @@ final class App: NSObject, NSApplicationDelegate {
         }
       }
       p.waitForLoad { err in
-        if let err { return reply(502, ["error": err, "url": p.web.url?.absoluteString ?? ""]) }
+        if let err { return reply(502, ["error": err, "url": p.engine.url?.absoluteString ?? ""]) }
         poll()
       }
     default:
+      if Engine.route?(route, p, input, reply) == true { return }
       reply(404, ["error": "unknown route \(route)"])
     }
   }
-
-  func nativeClick(_ p: Panel, x: Double, y: Double) {
-    let zoom = p.web.pageZoom * p.web.magnification
-    let pt = p.web.convert(NSPoint(x: x * zoom, y: y * zoom), to: nil)
-    let t = ProcessInfo.processInfo.systemUptime
-    for (type, dt) in [(NSEvent.EventType.leftMouseDown, 0.0), (.leftMouseUp, 0.03)] {
-      if let ev = NSEvent.mouseEvent(with: type, location: pt, modifierFlags: [], timestamp: t + dt,
-                                     windowNumber: p.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
-        p.window.sendEvent(ev)
-      }
-    }
-  }
-
-  func nativeKey(_ p: Panel, _ name: String) -> Bool {
-    let keys: [String: (UInt16, String)] = [
-      "enter": (36, "\r"), "return": (36, "\r"), "tab": (48, "\t"), "escape": (53, "\u{1b}"), "esc": (53, "\u{1b}"),
-      "backspace": (51, "\u{7f}"), "delete": (117, "\u{f728}"), "space": (49, " "),
-      "up": (126, "\u{f700}"), "down": (125, "\u{f701}"), "left": (123, "\u{f702}"), "right": (124, "\u{f703}"),
-      "home": (115, "\u{f729}"), "end": (119, "\u{f72b}"), "pageup": (116, "\u{f72c}"), "pagedown": (121, "\u{f72d}"),
-    ]
-    guard let (code, chars) = keys[name.lowercased()] else { return false }
-    if p.window.firstResponder == nil || p.window.firstResponder === p.window { p.window.makeFirstResponder(p.web) }
-    let t = ProcessInfo.processInfo.systemUptime
-    for type in [NSEvent.EventType.keyDown, .keyUp] {
-      if let ev = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: t, windowNumber: p.window.windowNumber,
-                                   context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
-        p.window.sendEvent(ev)
-      }
-    }
-    return true
-  }
 }
-
-let app = NSApplication.shared
-app.delegate = App.shared
-app.setActivationPolicy(.accessory)
-app.run()
