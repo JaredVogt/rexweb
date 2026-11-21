@@ -28,6 +28,10 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   /// A load was asked for or seen, and its end hasn't been reported yet.
   var awaiting = false
   var pendingLoadUntil = Date.distantPast
+  /// The browser exists and the protocol domains are on. A load asked for
+  /// before then waits in `queued`, so its requests and console are captured.
+  var ready = false
+  var queued: URL?
   var loadFailed = false
   var seen = ""
 
@@ -67,7 +71,12 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     if loading && !wasLoading { loadFailed = false; awaiting = true; panel?.engineStarted() }
     // A load can start and end between two polls, so a requested load that
     // never shows as loading still ends once its grace period is over.
-    if !loading && awaiting && (wasLoading || Date() > pendingLoadUntil) { finish() }
+    if !loading && awaiting && queued == nil && (wasLoading || Date() > pendingLoadUntil) { finish() }
+    // A load the page started itself can begin and end between two polls,
+    // after a caller saw it loading and began to wait. Don't leave it waiting.
+    if !loading && !awaiting, let p = panel, !p.loadWaiters.isEmpty {
+      if loadFailed { p.finishWaiters(p.lastError) } else { p.engineFinished() }
+    }
     wasLoading = loading
     let now = "\(page.url?.absoluteString ?? "") \(page.title) \(page.canGoBack) \(page.canGoForward)"
     if now != seen { seen = now; panel?.engineChanged() }
@@ -117,7 +126,10 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     }
   }
 
-  func load(_ url: URL) { expectLoad(); _ = page.load(url) }
+  func load(_ url: URL) {
+    expectLoad()
+    if ready { _ = page.load(url) } else { queued = url }
+  }
   func goBack() { if page.canGoBack { expectLoad() }; page.goBack() }
   func goForward() { if page.canGoForward { expectLoad() }; page.goForward() }
   func reload(fromOrigin: Bool) { expectLoad(); page.reload(ignoringCache: fromOrigin) }
@@ -162,8 +174,14 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
       guard let self else { return }
       do { try await self.page.ready() } catch { log("page not ready: \(error)") }
       for domain in ["Runtime", "Log", "Page", "Network"] {
-        do { _ = try await self.page.devTools.send("\(domain).enable"); }
+        do { _ = try await self.page.devTools.send("\(domain).enable") }
         catch { log("\(domain).enable failed: \(error)") }
+      }
+      self.ready = true
+      if let url = self.queued {
+        self.queued = nil
+        self.expectLoad()
+        _ = self.page.load(url)
       }
     })
   }
@@ -210,6 +228,11 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
 
   func requestStarted(_ e: CefJSON) {
     guard let id = e["requestId"].stringValue else { return }
+    // A redirect reuses the request's id for the next hop; close the hop it replaces.
+    let redirect = e["redirectResponse"]
+    if !redirect.isNull {
+      update(id) { $0["done"] = true; $0["status"] = redirect["status"].intValue ?? 0 }
+    }
     networkSeq += 1
     requestSeq[id] = networkSeq
     network.append([

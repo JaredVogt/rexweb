@@ -482,7 +482,7 @@ route() {
     out="$(curl -s -m 1 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
       -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
     m="$(jq -r --arg b "$block" '[.panels[]? | select($b == "" or .id == $b or (.id | endswith($b))
-        or ((.title // "") | ascii_downcase | contains($b | ascii_downcase)))] | (max_by(.active // 0) // {}) | .active // empty' \
+        or ((.label // .title // "") | ascii_downcase | contains($b | ascii_downcase)))] | (max_by(.active // 0) // {}) | .active // empty' \
       <<<"$out" 2>/dev/null)" || continue
     [ -n "$m" ] || continue
     if [ -z "$best" ] || awk -v a="$m" -v b="$best" 'BEGIN { exit !(a > b) }'; then best="$m"; bestport="$p"; fi
@@ -900,7 +900,8 @@ case "$cmd" in
         done
         [ -n "$file" ] || die "cookies set needs a FILE. Run \"rexweb cookies --help\"."
         set -- "$file"
-        ensure_app "$(engine_name "$engine")"
+        engine="$(engine_name "$engine")"
+        ensure_app "$engine"
         api /cookies "$(jq -c '{cookies:.}' "$1")" | jq -r '"Imported \(.set) cookies."'
         ;;
       ""|-h|--help|help) help_cmd cookies ;;

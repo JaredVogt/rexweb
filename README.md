@@ -279,12 +279,13 @@ require("rexweb").setup{
   split = "right",      -- right, left, above, or below
   ratio = 0.5,          -- the browser's share of the split
   home = "",            -- a new pane's page; empty focuses the address bar
-  engine = "chromium",  -- "webkit" or "chromium"; leave it out for WebKit
+  engine = "chromium",  -- "webkit" or "chromium"; leave it out to use config.json
 }
 ```
 
-`engine` here sets the engine for `Shift-Cmd-B` and the palette actions. The
-`engine` key in `config.json` below does not change them.
+`engine` here sets the engine for `Shift-Cmd-B` and the palette actions. When
+it is left out, they use the `engine` key in `config.json` below, which
+defaults to WebKit.
 
 ### Layout
 

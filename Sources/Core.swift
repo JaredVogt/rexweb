@@ -93,6 +93,12 @@ enum Auth {
       if let other = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), other.count >= 32 { return other }
       usleep(50_000)
     }
+    // The file is there but unusable (empty or cut short). Replace it whole,
+    // so the CLI and the other app read the same token this app answers to.
+    let tmp = file.appendingPathExtension("new-\(ProcessInfo.processInfo.processIdentifier)")
+    if fm.createFile(atPath: tmp.path, contents: Data(t.utf8), attributes: [.posixPermissions: 0o600]),
+       rename(tmp.path, file.path) == 0 { return t }
+    try? fm.removeItem(at: tmp)
     return t
   }()
 
@@ -379,7 +385,7 @@ final class Panel: NSObject, NSTextFieldDelegate {
 
   func info() -> [String: Any] {
     ["id": id, "session": session, "url": engine.url?.absoluteString ?? "", "title": engine.title,
-     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name,
+     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name, "label": lastLabel,
      "active": lastActive.timeIntervalSince1970]
   }
 
@@ -791,6 +797,7 @@ final class Tracker {
   }
 
   var lastChange = Date()
+  var lastRestackBoost = Date.distantPast
   var ticks = 0
 
   /// Runs 60 times a second while panes are moving, and 10 times a second
@@ -838,7 +845,15 @@ final class Tracker {
       // locked the overlay never appears in the window list, so it would
       // restack on every tick forever.
       if !p.visible { lastChange = Date() }
-      if !p.visible || !stacked { p.window.order(.above, relativeTo: rw.number) }
+      if !p.visible || !stacked {
+        p.window.order(.above, relativeTo: rw.number)
+        // Follow a restack at the fast rate for a fifth of a second, at most
+        // once every two seconds.
+        if Date().timeIntervalSince(lastRestackBoost) > 2 {
+          lastRestackBoost = Date()
+          lastChange = max(lastChange, Date().addingTimeInterval(-0.8))
+        }
+      }
       p.visible = true
       if p.pendingFocus {
         p.pendingFocus = false
