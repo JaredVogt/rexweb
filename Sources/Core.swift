@@ -11,6 +11,7 @@ struct Config {
   var port = 18802
   var chromiumPort = 18803
   var chromiumDebugPort = 0
+  var defaultEngine = "webkit"
   var searchURL = "https://www.google.com/search?q=%s"
   var fallbackBrowser = ""
   var linkTarget = "split"
@@ -50,6 +51,9 @@ struct Config {
     if let p = o["port"] as? NSNumber { c.port = p.intValue }
     if let p = o["chromium_port"] as? NSNumber { c.chromiumPort = p.intValue }
     if let p = o["chromium_debug_port"] as? NSNumber { c.chromiumDebugPort = p.intValue }
+    if let e = o["engine"] as? String {
+      if ["webkit", "chromium"].contains(e) { c.defaultEngine = e } else { c.configError = "engine must be \"webkit\" or \"chromium\"" }
+    }
     if let b = o["rex_bin"] as? String { c.rexBin = b }
     if let u = o["search_url"] as? String {
       if u.contains("%s") { c.searchURL = u } else { c.configError = "search_url needs %s where the query goes" }
@@ -77,7 +81,18 @@ enum Auth {
     var bytes = [UInt8](repeating: 0, count: 32)
     _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
     let t = bytes.map { String(format: "%02x", $0) }.joined()
-    fm.createFile(atPath: file.path, contents: Data(t.utf8), attributes: [.posixPermissions: 0o600])
+    // RexWeb and RexWebChromium share this file and can start together, so
+    // only one of them may create it; the other reads what was written.
+    let fd = open(file.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    if fd >= 0 {
+      _ = Data(t.utf8).withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+      Darwin.close(fd)
+      return t
+    }
+    for _ in 0..<20 {
+      if let other = try? String(contentsOf: file, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), other.count >= 32 { return other }
+      usleep(50_000)
+    }
     return t
   }()
 
@@ -1098,7 +1113,7 @@ enum Links {
     Rex.queue.async {
       var args = config.linkTarget == "tab" ? ["run"] : ["split", "--split=right"]
       if let s = frontRexSession() { args += ["-s", s] }
-      args += ["--shell=none", "--label", "browser", "--", "env", "REXWEB_FOCUS=true", "REXWEB_ENGINE=\(Engine.name)", pane, url.absoluteString]
+      args += ["--shell=none", "--label", "browser", "--", "env", "REXWEB_FOCUS=true", "REXWEB_ENGINE=\(config.defaultEngine)", pane, url.absoluteString]
       if Rex.run(args) == nil { DispatchQueue.main.async { forward(url) } }
     }
   }

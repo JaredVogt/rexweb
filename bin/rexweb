@@ -419,13 +419,19 @@ route() {
   [ -z "$bestport" ] || port="$bestport"
 }
 
+# Starts the app for an engine if it isn't running, and points $port at it.
 ensure_app() {
+  local engine="${1:-webkit}" name="RexWeb.app" flag="" app
+  if [ "$engine" = chromium ]; then
+    name="RexWebChromium.app" flag=" --with-chromium"
+    [ -n "${REXWEB_PORT:-}" ] || port="$cport"
+  fi
   raw /health >/dev/null 2>&1 && return 0
-  local app; app="$(app_path)"
-  [ -n "$app" ] || die "RexWeb.app isn't installed. Run ./install.sh in the rexweb repo."
+  app="$(app_path "$engine")"
+  [ -n "$app" ] || die "$name isn't installed. Run ./install.sh$flag in the rexweb repo."
   open -g "$app"
-  for _ in $(seq 1 50); do raw /health >/dev/null 2>&1 && return 0; sleep 0.1; done
-  die "RexWeb.app didn't start. Run \"rexweb doctor\"."
+  for _ in $(seq 1 100); do raw /health >/dev/null 2>&1 && return 0; sleep 0.1; done
+  die "$name didn't start. Run \"rexweb doctor\"."
 }
 
 api() {
@@ -772,9 +778,11 @@ case "$cmd" in
     sub="${1:-}"; shift || true
     case "$sub" in
       import)
-        domains=() profile="" reload=false
+        domains=() profile="" reload=false engine="${REXWEB_ENGINE:-$(jq -r '.engine // "webkit"' "$cfg" 2>/dev/null || echo webkit)}"
         while [ $# -gt 0 ]; do
           case "$1" in
+            --engine) need $# "$1"; engine="$2"; shift 2 ;;
+            --engine=*) engine="${1#*=}"; shift ;;
             --domain) need $# "$1"; domains+=("$2"); shift 2 ;;
             --domain=*) domains+=("${1#*=}"); shift ;;
             --profile) need $# "$1"; profile="$2"; shift 2 ;;
@@ -784,15 +792,26 @@ case "$cmd" in
             *) die "unknown argument: $1" ;;
           esac
         done
-        ensure_app
+        engine="$(engine_name "$engine")"
+        ensure_app "$engine"
         body="$(jq -nc --arg p "$profile" --argjson r "$reload" '{profile:(if $p == "" then null else $p end), reload:$r, domains:$ARGS.positional}' \
           --args ${domains[@]+"${domains[@]}"})"
         out="$(api /cookies/import "$body" 180)"
         if [ "$json" = 1 ]; then jq . <<<"$out"
-        else jq -r '"Imported \(.imported) cookies from Chrome" + (if .skipped > 0 then " (\(.skipped) couldn'"'"'t be decrypted)" else "" end) + "."' <<<"$out"; fi
+        else jq -r --arg e "$engine" '"Imported \(.imported) cookies from Chrome into \($e) panes" + (if .skipped > 0 then " (\(.skipped) couldn'"'"'t be decrypted)" else "" end) + "."' <<<"$out"; fi
         ;;
       set)
-        [ $# -ge 1 ] || die "cookies set needs a FILE. Run \"rexweb cookies --help\"."
+        engine="${REXWEB_ENGINE:-$(jq -r '.engine // "webkit"' "$cfg" 2>/dev/null || echo webkit)}" file=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --engine) need $# "$1"; engine="$2"; shift 2 ;;
+            --engine=*) engine="${1#*=}"; shift ;;
+            *) file="$1"; shift ;;
+          esac
+        done
+        [ -n "$file" ] || die "cookies set needs a FILE. Run \"rexweb cookies --help\"."
+        set -- "$file"
+        ensure_app "$(engine_name "$engine")"
         api /cookies "$(jq -c '{cookies:.}' "$1")" | jq -r '"Imported \(.set) cookies."'
         ;;
       ""|-h|--help|help) help_cmd cookies ;;
