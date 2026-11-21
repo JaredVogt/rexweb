@@ -44,6 +44,7 @@ Automation:
   html        Print the page's HTML, or one element's
   network     Print the page's network requests (Chromium panes)
   devtools    Open Chromium DevTools for a pane (Chromium panes)
+  cdp         Send a Chrome DevTools Protocol command (Chromium panes)
 
 Sign-in and links:
   cookies     Import cookies, such as a sign-in from Chrome
@@ -351,6 +352,26 @@ Options:
       --json         output {requests, last, dropped} as JSON; each request has seq, time, method, url, type, done, and, once known, status, mime, bytes, cached, error, canceled
 EOF
     ;;
+    cdp) cat <<'EOF'
+Send one Chrome DevTools Protocol command to a Chromium pane and print the
+result as JSON. PARAMS is a JSON object; leave it out for none.
+
+cdp reaches everything the protocol offers, so use it for what the other
+commands don't cover. It works on Chromium panes only, and it needs no
+debugging port.
+
+Examples:
+  rexweb cdp Page.getLayoutMetrics
+  rexweb cdp Runtime.evaluate '{"expression":"document.title","returnByValue":true}'
+  rexweb cdp Emulation.setDeviceMetricsOverride '{"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
+
+Usage:
+  rexweb cdp METHOD [PARAMS] [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
     devtools) cat <<'EOF'
 Open Chromium DevTools for a Chromium pane. "devtools close" closes it.
 
@@ -477,16 +498,28 @@ route() {
   [ "$routed" = 0 ] || return 0
   routed=1
   [ -z "${REXWEB_PORT:-}" ] || return 0
-  local best="" bestport="" p out m
+  local best="" bestport="" p out m hits="" apps=0
   for p in "$wport" "$cport"; do
     out="$(curl -s -m 1 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
       -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
-    m="$(jq -r --arg b "$block" '[.panels[]? | select($b == "" or .id == $b or (.id | endswith($b))
+    # A full pane ID names one pane, whatever else the text happens to match.
+    if [ -n "$block" ] && jq -e --arg b "$block" 'any(.panels[]?; .id == $b)' <<<"$out" >/dev/null 2>&1; then
+      port="$p"; return 0
+    fi
+    m="$(jq -r --arg b "$block" '[.panels[]? | select($b == "" or (.id | endswith($b))
         or ((.label // .title // "") | ascii_downcase | contains($b | ascii_downcase)))] | (max_by(.active // 0) // {}) | .active // empty' \
       <<<"$out" 2>/dev/null)" || continue
     [ -n "$m" ] || continue
+    apps=$((apps + 1))
+    hits="$hits$(jq -r --arg b "$block" '.panels[]? | select((.id | endswith($b))
+        or ((.label // .title // "") | ascii_downcase | contains($b | ascii_downcase)))
+        | "  \(.id[-6:])  \(.engine // "webkit")  \(.url // "")"' <<<"$out" 2>/dev/null)"$'\n'
     if [ -z "$best" ] || awk -v a="$m" -v b="$best" 'BEGIN { exit !(a > b) }'; then best="$m"; bestport="$p"; fi
   done
+  # One app refuses a fragment that matches two of its panes. Do the same across both apps.
+  if [ -n "$block" ] && [ "$apps" -gt 1 ]; then
+    die "more than one pane matches \"$block\". Use more of the ID:"$'\n'"${hits%$'\n'}"
+  fi
   [ -z "$bestport" ] || port="$bestport"
 }
 
@@ -834,6 +867,16 @@ case "$cmd" in
       '{id:$id, since:$s, limit:$n, clear:$c, failed:$f}')")"
     if [ "$json" = 1 ]; then jq . <<<"$out"
     else jq -r '.requests[] | "\(.seq)\t\(if .error then "ERR" elif .status then (.status | tostring) elif .done then "-" else "..." end)\t\(.method)\t\(.type)\t\(.url)" + (if .error then "  (\(.error))" else "" end)' <<<"$out"; fi
+    ;;
+
+  cdp)
+    parse "$@"
+    [ -n "${rest[0]:-}" ] || die "cdp needs a method, such as Page.getLayoutMetrics"
+    [ "${#rest[@]}" -le 2 ] || die "unknown argument: ${rest[2]}"
+    params="${rest[1]:-}"; [ -n "$params" ] || params="{}"
+    jq -e 'type == "object"' <<<"$params" >/dev/null 2>&1 || die "PARAMS must be a JSON object, such as '{\"enabled\":true}'"
+    out="$(chromium_only /cdp "$(jq -nc --arg id "$block" --arg m "${rest[0]}" --argjson p "$params" '{id:$id, method:$m, params:$p}')")"
+    jq .result <<<"$out"
     ;;
 
   devtools)

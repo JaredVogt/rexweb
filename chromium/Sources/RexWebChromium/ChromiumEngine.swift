@@ -368,6 +368,12 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
       if input["clear"] as? Bool == true { network = []; requestSeq = [:]; early = [:] }
       reply(200, result)
       return true
+    case "/cdp":
+      guard let method = input["method"] as? String, !method.isEmpty else { reply(400, ["error": "method required"]); return true }
+      send(method, CefJSON(foundationValue: input["params"] ?? [String: Any]())) { result, err in
+        if let result { reply(200, ["result": foundation(result) ?? NSNull()]) } else { reply(400, ["error": err ?? "\(method) failed"]) }
+      }
+      return true
     case "/devtools":
       if input["close"] as? Bool == true { page.closeDevTools() } else { page.showDevTools() }
       reply(200, ["devtools": input["close"] as? Bool == true ? "closed" : "open"])

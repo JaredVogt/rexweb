@@ -149,6 +149,7 @@ $ rexweb eval -b "$id" 'document.querySelector("#meta").textContent'
 | `html [SELECTOR]` | Print the live HTML of the page or of one element |
 | `network` | Chromium panes only. Print the page's requests; `--failed`, `--since N`, `--clear` |
 | `devtools [close]` | Chromium panes only. Open or close Chromium DevTools |
+| `cdp METHOD [PARAMS]` | Chromium panes only. Send one Chrome DevTools Protocol command and print the result |
 | `back`, `forward`, `reload`, `info`, `ls`, `focus`, `close` | |
 
 Scripts and agents must keep the ID from `open` and pass it with `-b ID`.
@@ -211,8 +212,21 @@ start with their origin in brackets, such as `[network]` or `[security]`.
 
 `rexweb network` prints each request's number, status, method, type, and URL.
 A failed request shows `ERR` and the reason. Each pane keeps its last 1000
-requests. Headers and bodies are not kept. `network` and `devtools` fail with
-a clear error on a WebKit pane.
+requests. Headers and bodies are not kept. `network`, `devtools`, and `cdp`
+fail with a clear error on a WebKit pane.
+
+`rexweb cdp` sends one Chrome DevTools Protocol command to the pane and prints
+the result as JSON. It covers what the other commands don't, and it needs no
+debugging port:
+
+```sh
+rexweb cdp -b "$id" Page.getLayoutMetrics
+rexweb cdp -b "$id" Emulation.setDeviceMetricsOverride \
+  '{"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
+```
+
+A `-b` value that matches panes in both apps is refused, with the matching
+panes listed. Use more of the pane ID.
 
 ### The DevTools Protocol port
 

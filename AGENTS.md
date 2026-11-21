@@ -109,6 +109,8 @@ rexweb click -b "$id" e3
 rexweb network -b "$id" --since "$n"         # only what the click caused
 rexweb devtools -b "$id"                     # opens Chromium DevTools for the person
 rexweb devtools -b "$id" close
+rexweb cdp -b "$id" Page.getLayoutMetrics    # any DevTools Protocol command; prints JSON
+rexweb cdp -b "$id" Emulation.setDeviceMetricsOverride '{"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
 ```
 
 - If `open --engine chromium` says RexWebChromium.app isn't installed, use
@@ -117,8 +119,13 @@ rexweb devtools -b "$id" close
   `ERR` and the reason, including CORS and blocked-request reasons. It has no
   headers or bodies; use `eval` with `fetch` if you need them.
   `network --json` prints `{requests, last, dropped}`.
-- `network` and `devtools` exit 1 on a WebKit pane and tell you to open a
-  Chromium one.
+- `network`, `devtools`, and `cdp` exit 1 on a WebKit pane and tell you to
+  open a Chromium one.
+- `cdp METHOD [PARAMS]` takes PARAMS as a JSON object and prints the command's
+  result. A protocol error exits 1 with the protocol's message. Prefer the
+  named commands; use `cdp` for what they don't cover.
+- A `-b` value that matches panes in both apps exits 1 and lists them. Pass
+  more of the pane ID.
 - Chromium can't play H.264 or AAC (MP4) video. WebM works. Test MP4 video in
   a WebKit pane.
 - Each engine has its own cookies. A sign-in in one doesn't carry to the
