@@ -10,6 +10,7 @@ struct Config {
   var gap: Double?, header: Double?, radius: Double?
   var port = 18802
   var chromiumPort = 18803
+  var chromiumDebugPort = 0
   var searchURL = "https://www.google.com/search?q=%s"
   var fallbackBrowser = ""
   var linkTarget = "split"
@@ -48,6 +49,7 @@ struct Config {
     c.gap = n("gap"); c.header = n("header"); c.radius = n("radius")
     if let p = o["port"] as? NSNumber { c.port = p.intValue }
     if let p = o["chromium_port"] as? NSNumber { c.chromiumPort = p.intValue }
+    if let p = o["chromium_debug_port"] as? NSNumber { c.chromiumDebugPort = p.intValue }
     if let b = o["rex_bin"] as? String { c.rexBin = b }
     if let u = o["search_url"] as? String {
       if u.contains("%s") { c.searchURL = u } else { c.configError = "search_url needs %s where the query goes" }
@@ -362,7 +364,8 @@ final class Panel: NSObject, NSTextFieldDelegate {
 
   func info() -> [String: Any] {
     ["id": id, "session": session, "url": engine.url?.absoluteString ?? "", "title": engine.title,
-     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name]
+     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name,
+     "active": lastActive.timeIntervalSince1970]
   }
 
   static func normalize(_ raw: String) -> URL? {
@@ -438,8 +441,8 @@ final class Panel: NSObject, NSTextFieldDelegate {
 
   func engineChanged() { updateChrome() }
   func engineStarted() { lastError = nil }
-  func engineCommitted() {
-    let u = engine.url?.absoluteString ?? ""
+  func engineCommitted(_ url: String? = nil) {
+    let u = url ?? engine.url?.absoluteString ?? ""
     record(level: "navigation", text: "Navigated to \(u)", url: u)
   }
   func engineFinished() { lastError = nil; finishWaiters(nil); updateChrome() }
@@ -1095,7 +1098,7 @@ enum Links {
     Rex.queue.async {
       var args = config.linkTarget == "tab" ? ["run"] : ["split", "--split=right"]
       if let s = frontRexSession() { args += ["-s", s] }
-      args += ["--shell=none", "--label", "browser", "--", "env", "REXWEB_FOCUS=true", pane, url.absoluteString]
+      args += ["--shell=none", "--label", "browser", "--", "env", "REXWEB_FOCUS=true", "REXWEB_ENGINE=\(Engine.name)", pane, url.absoluteString]
       if Rex.run(args) == nil { DispatchQueue.main.async { forward(url) } }
     }
   }
@@ -1236,7 +1239,7 @@ final class App: NSObject, NSApplicationDelegate {
   func openPane(beside id: String, session: String, url: String) {
     let pane = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/rexweb-pane").path
     Rex.async(["split", "-s", session, "-b", id, "--split=right", "--shell=none", "--label", "browser",
-               "--", "env", "REXWEB_FOCUS=true", pane, url])
+               "--", "env", "REXWEB_FOCUS=true", "REXWEB_ENGINE=\(Engine.name)", pane, url])
   }
 
   func resolve(_ raw: Any?) -> Panel? {

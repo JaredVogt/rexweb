@@ -5,6 +5,9 @@ set -eo pipefail
 cfg="$HOME/.rexweb/config.json"
 port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
 self="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+# RexWeb.app (WebKit) and RexWebChromium.app (Chromium) each serve their own panes.
+wport="$port"
+cport="${REXWEB_CHROMIUM_PORT:-$(jq -r '.chromium_port // 18803' "$cfg" 2>/dev/null || echo 18803)}"
 
 # ---------------------------------------------------------------- help text
 
@@ -380,9 +383,40 @@ raw() {
 }
 
 app_path() {
-  for a in "${self%/Contents/Resources}" "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app"; do
-    case "$a" in *.app) [ -d "$a" ] && { echo "$a"; return; } ;; esac
+  local name="RexWeb.app" a
+  [ "${1:-webkit}" = chromium ] && name="RexWebChromium.app"
+  for a in "$(dirname "${self%/Contents/Resources}")/$name" "$HOME/Applications/$name" "/Applications/$name"; do
+    [ -d "$a" ] && { echo "$a"; return; }
   done
+  return 0
+}
+
+engine_name() {
+  case "$1" in
+    webkit|safari) echo webkit ;;
+    chromium|chrome|cef) echo chromium ;;
+    *) die "unknown engine \"$1\": use webkit or chromium" ;;
+  esac
+}
+
+# Point $port at the app that owns the pane a command names. With no pane
+# named, that is the app whose pane was used most recently.
+routed=0
+route() {
+  [ "$routed" = 0 ] || return 0
+  routed=1
+  [ -z "${REXWEB_PORT:-}" ] || return 0
+  local best="" bestport="" p out m
+  for p in "$wport" "$cport"; do
+    out="$(curl -s -m 1 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
+      -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
+    m="$(jq -r --arg b "$block" '[.panels[]? | select($b == "" or .id == $b or (.id | endswith($b))
+        or ((.title // "") | ascii_downcase | contains($b | ascii_downcase)))] | (max_by(.active // 0) // {}) | .active // empty' \
+      <<<"$out" 2>/dev/null)" || continue
+    [ -n "$m" ] || continue
+    if [ -z "$best" ] || awk -v a="$m" -v b="$best" 'BEGIN { exit !(a > b) }'; then best="$m"; bestport="$p"; fi
+  done
+  [ -z "$bestport" ] || port="$bestport"
 }
 
 ensure_app() {
@@ -396,11 +430,22 @@ ensure_app() {
 
 api() {
   local path="$1" body="${2:-{\}}" timeout="${3:-30}" out code
+  case "$path" in /list|/health|/cookies|/cookies/import|/links|/default-browser) ;; *) route ;; esac
   out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
     -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" ||
     die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [ "$code" -ge 400 ]; then die "$(jq -r '.error // .' <<<"$out" 2>/dev/null || echo "$out")"; fi
+  printf '%s\n' "$out"
+}
+
+# Calls a route only Chromium panes have, with a plain error for WebKit panes.
+chromium_only() {
+  local out
+  if ! out="$(api "$@" 2>&1)"; then
+    case "$out" in *"unknown route"*) die "$cmd needs a Chromium pane. Open one with \"rexweb open --engine chromium URL\"." ;; esac
+    die "${out#Error: }"
+  fi
   printf '%s\n' "$out"
 }
 
@@ -430,7 +475,7 @@ target() { jq -nc --arg id "$block" '{id:$id}'; }
 
 need() { [ "$1" -ge 2 ] || die "flag needs an argument: $2"; }
 
-pane_line() { jq -r '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)"'; }
+pane_line() { jq -r '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .engine == "chromium" then "  [chromium]" else "" end)'; }
 
 print_info() { if [ "$json" = 1 ]; then jq .; else pane_line; fi; }
 
@@ -489,6 +534,7 @@ case "$cmd" in
   open|new)
     cmd=open
     url="" split="right" ratio="" anchor="${REX_BLOCK:-}" session="${REX_SESSION:-}" tab=0 focus=true wait=1
+    engine="${REXWEB_ENGINE:-$(jq -r '.engine // "webkit"' "$cfg" 2>/dev/null || echo webkit)}"
     while [ $# -gt 0 ]; do
       case "$1" in
         --split) need $# "$1"; split="$2"; shift 2 ;;
@@ -498,6 +544,8 @@ case "$cmd" in
         -b|--block) need $# "$1"; anchor="$2"; shift 2 ;;
         -s|--session) need $# "$1"; session="$2"; shift 2 ;;
         --tab) tab=1; shift ;;
+        --engine) need $# "$1"; engine="$2"; shift 2 ;;
+        --engine=*) engine="${1#*=}"; shift ;;
         --focus) if [ "${2:-}" = true ] || [ "${2:-}" = false ]; then focus="$2"; shift 2; else focus=true; shift; fi ;;
         --focus=*) focus="${1#*=}"; shift ;;
         --no-focus) focus=false; shift ;;
@@ -512,16 +560,21 @@ case "$cmd" in
     case "$focus" in true|false) ;; *) die "invalid --focus \"$focus\": use true or false" ;; esac
     if [ -n "$ratio" ]; then case "$ratio" in *[!0-9]*) die "invalid --ratio \"$ratio\": use a percent from 1 to 99" ;; esac; fi
     command -v rex >/dev/null 2>&1 || die "the rex command isn't on PATH. Install Rex, or run this from a Rex pane."
+    engine="$(engine_name "$engine")"
+    if [ "$engine" = chromium ]; then
+      [ -n "$(app_path chromium)" ] || die "RexWebChromium.app isn't installed. Run ./install.sh --with-chromium in the rexweb repo."
+      [ -n "${REXWEB_PORT:-}" ] || port="$cport"
+    fi
     pb="$(pane_bin)"
     opts=(--shell=none --label browser --json --focus="$focus")
     [ -n "$session" ] && opts+=(-s "$session")
     if [ "$tab" = 1 ]; then
-      res="$(rex run "${opts[@]}" -- env REXWEB_FOCUS="$focus" "$pb" "$url")"
+      res="$(rex run "${opts[@]}" -- env REXWEB_FOCUS="$focus" REXWEB_ENGINE="$engine" "$pb" "$url")"
     else
       opts+=(--split="$split")
       [ -n "$ratio" ] && opts+=(--ratio "$ratio")
       [ -n "$anchor" ] && opts+=(-b "$anchor")
-      res="$(rex split "${opts[@]}" -- env REXWEB_FOCUS="$focus" "$pb" "$url")"
+      res="$(rex split "${opts[@]}" -- env REXWEB_FOCUS="$focus" REXWEB_ENGINE="$engine" "$pb" "$url")"
     fi
     id="$(jq -r '.block_ids[0] // empty' <<<"$res" 2>/dev/null)"
     [ -n "$id" ] || die "Rex didn't open a pane: $res"
@@ -533,7 +586,7 @@ case "$cmd" in
     done
     if [ "$registered" = 0 ]; then
       echo "$id"
-      die "opened pane $id, but RexWeb didn't pick it up. Run \"rexweb doctor\"."
+      die "opened pane $id, but the $engine app didn't pick it up. Run \"rexweb doctor\"."
     fi
     err=""
     if [ "$wait" = 1 ]; then
@@ -557,7 +610,16 @@ case "$cmd" in
 
   ls|list)
     parse "$@"
-    out="$(api /list)"
+    out='{"panels":[]}' up=0
+    for p in "$wport" "$cport"; do
+      [ -z "${REXWEB_PORT:-}" ] || [ "$p" = "$port" ] || continue
+      one="$(curl -s -m 2 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
+        -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
+      jq -e '.panels' >/dev/null 2>&1 <<<"$one" || continue
+      up=1
+      out="$(jq -c -s '{panels: (.[0].panels + .[1].panels | sort_by(-(.active // 0)))}' <<<"$out$one")"
+    done
+    [ "$up" = 1 ] || die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
     if [ "$json" = 1 ]; then jq . <<<"$out"; else jq -c '.panels[]' <<<"$out" | while read -r p; do pane_line <<<"$p"; done; fi
     ;;
 
@@ -655,6 +717,37 @@ case "$cmd" in
       '{id:$id, since:$s, limit:$n, clear:$c, levels:($l | split(",") | map(select(. != "")))}')")"
     if [ "$json" = 1 ]; then jq . <<<"$out"
     else jq -r '.messages[] | "\(.seq)\t\(.level)\t\(.text)" + (if (.source // "") != "" then "  (\(.source))" else "" end)' <<<"$out"; fi
+    ;;
+
+  network|net)
+    cmd=network; parse "$@"
+    since=0 limit=0 clear=false failed=false
+    set -- ${rest[@]+"${rest[@]}"}
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --since) need $# "$1"; since="$2"; shift 2 ;;
+        --since=*) since="${1#*=}"; shift ;;
+        --limit) need $# "$1"; limit="$2"; shift 2 ;;
+        --limit=*) limit="${1#*=}"; shift ;;
+        --failed) failed=true; shift ;;
+        --clear) clear=true; shift ;;
+        *) die "unknown argument: $1" ;;
+      esac
+    done
+    case "$since" in ''|*[!0-9]*) die "invalid --since \"$since\": use a request number" ;; esac
+    case "$limit" in ''|*[!0-9]*) die "invalid --limit \"$limit\": use a number of requests" ;; esac
+    out="$(chromium_only /network "$(jq -nc --arg id "$block" --argjson s "$since" --argjson n "$limit" --argjson c "$clear" --argjson f "$failed" \
+      '{id:$id, since:$s, limit:$n, clear:$c, failed:$f}')")"
+    if [ "$json" = 1 ]; then jq . <<<"$out"
+    else jq -r '.requests[] | "\(.seq)\t\(if .error then "ERR" elif .status then (.status | tostring) elif .done then "-" else "..." end)\t\(.method)\t\(.type)\t\(.url)" + (if .error then "  (\(.error))" else "" end)' <<<"$out"; fi
+    ;;
+
+  devtools)
+    parse "$@"
+    close=false
+    [ "${rest[0]:-}" = close ] && close=true
+    chromium_only /devtools "$(jq -nc --arg id "$block" --argjson c "$close" '{id:$id, close:$c}')" >/dev/null
+    [ "$close" = true ] && echo "closed DevTools" || echo "opened DevTools"
     ;;
 
   html)

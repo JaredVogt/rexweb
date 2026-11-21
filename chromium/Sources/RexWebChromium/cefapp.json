@@ -1,0 +1,6 @@
+{
+  "bundleIdentifier": "dev.coey.rexweb.chromium",
+  "displayName": "RexWebChromium",
+  "minimumSystemVersion": "15.0",
+  "infoPlist": { "LSUIElement": true }
+}

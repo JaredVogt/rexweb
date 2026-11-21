@@ -1,0 +1,33 @@
+import AppKit
+import CefKit
+
+@main
+@MainActor
+enum Main {
+  static func main() {
+    CefApplication.install()
+    config.port = config.chromiumPort
+    Engine.name = "chromium"
+    Engine.label = "Chromium"
+    Engine.make = { panel in onMain { ChromiumEngine(panel: panel) } }
+    Engine.setCookies = { cookies, done in onMain { ChromiumEngine.setCookies(cookies, done) } }
+    Engine.route = { route, panel, input, reply in
+      onMain { (panel.engine as? ChromiumEngine)?.route(route, input, reply) ?? false }
+    }
+
+    var configuration = CefRuntime.Configuration.embedded
+    // The embedded preset turns this off; panes visit arbitrary sites, so keep
+    // certificate revocation and Safe Browsing lists current.
+    configuration.services.componentUpdates = .automatic
+    configuration.rootCacheDirectory = Config.dir.appendingPathComponent("chromium", isDirectory: true)
+    if config.chromiumDebugPort > 0 { configuration.remoteDebuggingPort = config.chromiumDebugPort }
+    do { try CefRuntime.shared.initialize(configuration: configuration) } catch {
+      log("Chromium failed to start: \(error)")
+      exit(1)
+    }
+
+    NSApp.delegate = App.shared
+    NSApp.setActivationPolicy(.accessory)
+    NSApp.run()
+  }
+}

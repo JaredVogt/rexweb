@@ -6,7 +6,14 @@ set -u
 PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
 cfg="$HOME/.rexweb/config.json"
-port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
+engine="${REXWEB_ENGINE:-webkit}"
+appname="RexWeb"
+if [ "$engine" = chromium ]; then
+  appname="RexWebChromium"
+  port="${REXWEB_PORT:-$(jq -r '.chromium_port // 18803' "$cfg" 2>/dev/null || echo 18803)}"
+else
+  port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
+fi
 id="${REX_BLOCK:?rexweb-pane must run inside a Rex pane}"
 session="${REX_SESSION:?rexweb-pane must run inside a Rex pane}"
 focus="${REXWEB_FOCUS:-false}"
@@ -28,8 +35,11 @@ show() {
 
 app_path() {
   if [ -n "${REXWEB_APP:-}" ]; then echo "$REXWEB_APP"; return; fi
-  case "$here" in */RexWeb.app/Contents/Resources) [ -d "${here%/Contents/Resources}" ] && { echo "${here%/Contents/Resources}"; return; } ;; esac
-  for a in "$HOME/Applications/RexWeb.app" "/Applications/RexWeb.app"; do
+  case "$here" in */Contents/Resources)
+    local beside; beside="$(dirname "${here%/Contents/Resources}")/${appname}.app"
+    [ -d "$beside" ] && { echo "$beside"; return; } ;;
+  esac
+  for a in "$HOME/Applications/${appname}.app" "/Applications/${appname}.app"; do
     [ -d "$a" ] && { echo "$a"; return; }
   done
 }
@@ -38,10 +48,10 @@ ensure_app() {
   post /health '{}' 1 >/dev/null && return 0
   local app; app="$(app_path)"
   [ -n "$app" ] || return 2
-  show "rexweb · starting RexWeb…"
+  show "rexweb · starting ${appname}…"
   open -g "$app"
   for _ in $(seq 1 50); do post /health '{}' 1 >/dev/null && return 0; sleep 0.1; done
-  show "rexweb · RexWeb didn't start. Run: rexweb doctor"
+  show "rexweb · ${appname} didn't start. Run: rexweb doctor"
   return 1
 }
 
@@ -60,7 +70,7 @@ connect() {
   ensure_app
   case $? in
     0) register ;;
-    2) show "rexweb · RexWeb.app isn't installed. Close this pane, or run ./install.sh"; missing=$((missing + 1)) ;;
+    2) show "rexweb · ${appname}.app isn't installed. Close this pane, or run ./install.sh"; missing=$((missing + 1)) ;;
   esac
 }
 
