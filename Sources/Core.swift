@@ -625,12 +625,46 @@ final class Tracker {
     out.fileHandleForReading.readabilityHandler = { [weak self] h in
       let d = h.availableData
       if d.isEmpty { return }
-      DispatchQueue.main.async { self?.refreshAll() }
+      DispatchQueue.main.async { self?.events(d) }
     }
     p.terminationHandler = { [weak self] _ in
       DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.startEvents() }
     }
     do { try p.run(); eventsProcess = p } catch { log("events failed: \(error)") }
+  }
+
+  var eventBuffer = Data()
+  var refreshScheduled = false
+
+  /// Every `rex` command this app runs connects to the server and leaves
+  /// again, and Rex reports both. Refreshing on those would run more
+  /// commands, which report more events, without end.
+  static let ownNoise: Set<String> = ["client_joined", "client_left", "client_connected", "client_disconnected"]
+
+  static func changesLayout(_ line: Data) -> Bool {
+    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return true }
+    let type = o["type"] as? String ?? ""
+    if ownNoise.contains(type) { return false }
+    if type == "session_event",
+       let inner = ((o["payload"] as? [String: Any])?["event"] as? [String: Any])?["type"] as? String,
+       ownNoise.contains(inner) { return false }
+    return true
+  }
+
+  func events(_ d: Data) {
+    eventBuffer.append(d)
+    var relevant = false
+    while let nl = eventBuffer.firstIndex(of: 10) {
+      if Tracker.changesLayout(eventBuffer[eventBuffer.startIndex..<nl]) { relevant = true }
+      eventBuffer.removeSubrange(eventBuffer.startIndex...nl)
+    }
+    if eventBuffer.count > 1 << 20 { eventBuffer.removeAll() }
+    guard relevant, !refreshScheduled else { return }
+    refreshScheduled = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+      self?.refreshScheduled = false
+      self?.refreshAll()
+    }
   }
 
   func refreshAll() {
@@ -756,9 +790,17 @@ final class Tracker {
     return w["focused_block_id"] as? String
   }
 
+  var lastChange = Date()
+  var ticks = 0
+
+  /// Runs 60 times a second while panes are moving, and 10 times a second
+  /// once nothing has changed for a second: listing every window on screen is
+  /// the expensive part, and an idle pane doesn't need it that often.
   func tick() {
     let panels = App.shared.panels.values
     if panels.isEmpty { return }
+    ticks += 1
+    if Date().timeIntervalSince(lastChange) > 1, ticks % 6 != 0 { return }
     let (rexWins, order) = Tracker.rexWindows()
     let rexActive = NSWorkspace.shared.frontmostApplication?.bundleIdentifier?.hasPrefix("com.superlogical.rex") == true
     let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
@@ -772,6 +814,7 @@ final class Tracker {
       let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
       if key != p.layoutKey {
         p.layoutKey = key
+        lastChange = Date()
         p.settleUntil = Date().addingTimeInterval(0.4)
         if p.window.isKeyWindow { p.pendingFocus = true }
       }
@@ -782,7 +825,7 @@ final class Tracker {
       let x0 = (body.minX).rounded(.up), x1 = (body.maxX).rounded(.down)
       let y0 = (body.minY).rounded(.up), y1 = (body.maxY).rounded(.down)
       let ns = NSRect(x: x0, y: primaryHeight - y1, width: x1 - x0, height: y1 - y0)
-      if ns != p.lastFrame { p.window.setFrame(ns, display: true); p.lastFrame = ns }
+      if ns != p.lastFrame { p.window.setFrame(ns, display: true); p.lastFrame = ns; lastChange = Date() }
 
       let mine = p.window.windowNumber
       let iMine = order.firstIndex(of: mine), iRex = order.firstIndex(of: rw.number)
@@ -791,6 +834,10 @@ final class Tracker {
       if let iMine, let iRex, iMine < iRex {
         stacked = order[(iMine + 1)..<iRex].allSatisfy { ours.contains($0) }
       }
+      // Restacking alone doesn't keep the fast rate going: with the screen
+      // locked the overlay never appears in the window list, so it would
+      // restack on every tick forever.
+      if !p.visible { lastChange = Date() }
       if !p.visible || !stacked { p.window.order(.above, relativeTo: rw.number) }
       p.visible = true
       if p.pendingFocus {
@@ -867,7 +914,7 @@ final class Tracker {
   }
 
   func hide(_ p: Panel) {
-    if p.visible { p.window.orderOut(nil); p.visible = false }
+    if p.visible { p.window.orderOut(nil); p.visible = false; lastChange = Date() }
   }
 }
 
