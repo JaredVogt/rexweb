@@ -41,6 +41,8 @@ rexweb click -b "$id" e3                  # refs last until the next snapshot
 rexweb type -b "$id" --submit e1 'hello'
 rexweb wait -b "$id" --text 'Saved'
 rexweb eval -b "$id" 'document.title'     # prints JSON
+rexweb console -b "$id" --level error     # console messages and page errors
+rexweb html -b "$id" '#app'               # live HTML of the page or one element
 rexweb screenshot -b "$id" /tmp/page.png
 rexweb close -b "$id"
 ```
@@ -57,6 +59,15 @@ rexweb close -b "$id"
 - `info --json` prints `{id, session, url, title, loading, visible, error}`.
   `visible` turns false for about half a second while Rex rearranges panes,
   so poll it rather than reading it once.
+- `console` prints each pane's last 1000 messages, oldest first: `console.*`
+  calls, uncaught errors, unhandled rejections, failed resource loads,
+  Content Security Policy blocks, and a `navigation` line per page load.
+  Capture starts before the page's scripts run. Each line starts with the
+  message's number; `--since N` prints only later ones, so read
+  `rexweb console --json | jq .last` before an action and pass it afterward.
+  It doesn't capture the browser's own messages (such as CORS refusals) or
+  network traffic, and pages opened from `file://` report uncaught errors
+  only as "Script error."
 - Errors go to stderr as `Error: ...`, with exit status 1.
 
 ## Needs a person

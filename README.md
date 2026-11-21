@@ -130,6 +130,8 @@ $ rexweb eval -b "$id" 'document.querySelector("#meta").textContent'
 | `eval JS` | Run JavaScript, `await` included; prints JSON |
 | `wait` | Wait until `--selector` matches, `--text` appears, or the page loads |
 | `screenshot [PATH]` | Save a PNG |
+| `console` | Print console messages and page errors; `--level`, `--since N`, `--clear` |
+| `html [SELECTOR]` | Print the live HTML of the page or of one element |
 | `back`, `forward`, `reload`, `info`, `ls`, `focus`, `close` | |
 
 Scripts and agents must keep the ID from `open` and pass it with `-b ID`.

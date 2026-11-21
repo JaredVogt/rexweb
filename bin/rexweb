@@ -36,6 +36,8 @@ Automation:
   eval        Evaluate JavaScript and print the result
   wait        Wait for an element, some text, or the page to load
   screenshot  Save a PNG of the page
+  console     Print the page's console messages and errors
+  html        Print the page's HTML, or one element's
 
 Sign-in and links:
   cookies     Import cookies, such as a sign-in from Chrome
@@ -262,6 +264,52 @@ rexweb saves the PNG in a temporary directory.
 
 Usage:
   rexweb screenshot [PATH] [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+EOF
+    ;;
+    console) cat <<'EOF'
+Print what a browser pane's pages wrote to the console, oldest first.
+
+Each pane keeps its last 1000 messages: console.log, info, warn, error, and
+debug calls, uncaught errors, unhandled promise rejections, resources that
+failed to load, Content Security Policy blocks, and a "navigation" line each
+time a page loads. Messages from iframes are included. Capture starts before
+the page's own scripts run.
+
+Each line starts with the message's number. Pass the last number you saw to
+--since to print only what came after it.
+
+Examples:
+  rexweb console
+  rexweb console --level error,warn
+  n=$(rexweb console --json | jq .last); rexweb click e3; rexweb console --since "$n"
+
+Usage:
+  rexweb console [flags]
+
+Options:
+  -b, --block BLOCK   act on BLOCK (defaults to the most recently used browser pane)
+      --level LEVELS  print only LEVELS, a comma-separated list of log, info, warn, error, debug, navigation
+      --since N       print only messages numbered above N
+      --limit N       print only the newest N messages
+      --clear         forget the pane's messages after printing them
+      --json          output {messages, last, dropped} as JSON
+
+The browser's own messages, such as why a CORS request was refused, and
+network traffic aren't captured.
+EOF
+    ;;
+    html) cat <<'EOF'
+Print the live HTML of the page, or of the first element SELECTOR matches.
+
+Examples:
+  rexweb html
+  rexweb html '#app'
+
+Usage:
+  rexweb html [SELECTOR] [flags]
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
@@ -583,6 +631,38 @@ case "$cmd" in
     case "$timeout" in ''|*[!0-9.]*) die "invalid --timeout \"$timeout\": use a number of seconds" ;; esac
     api /wait "$(jq -nc --arg id "$block" --arg s "$sel" --arg t "$text" --argjson to "$timeout" \
       '{id:$id, selector:$s, text:$t, timeout:$to}')" $((timeout + 5)) | print_info
+    ;;
+
+  console)
+    parse "$@"
+    levels="" since=0 limit=0 clear=false
+    set -- ${rest[@]+"${rest[@]}"}
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --level|--levels) need $# "$1"; levels="$2"; shift 2 ;;
+        --level=*|--levels=*) levels="${1#*=}"; shift ;;
+        --since) need $# "$1"; since="$2"; shift 2 ;;
+        --since=*) since="${1#*=}"; shift ;;
+        --limit) need $# "$1"; limit="$2"; shift 2 ;;
+        --limit=*) limit="${1#*=}"; shift ;;
+        --clear) clear=true; shift ;;
+        *) die "unknown argument: $1" ;;
+      esac
+    done
+    case "$since" in ''|*[!0-9]*) die "invalid --since \"$since\": use a message number" ;; esac
+    case "$limit" in ''|*[!0-9]*) die "invalid --limit \"$limit\": use a number of messages" ;; esac
+    out="$(api /console "$(jq -nc --arg id "$block" --arg l "$levels" --argjson s "$since" --argjson n "$limit" --argjson c "$clear" \
+      '{id:$id, since:$s, limit:$n, clear:$c, levels:($l | split(",") | map(select(. != "")))}')")"
+    if [ "$json" = 1 ]; then jq . <<<"$out"
+    else jq -r '.messages[] | "\(.seq)\t\(.level)\t\(.text)" + (if (.source // "") != "" then "  (\(.source))" else "" end)' <<<"$out"; fi
+    ;;
+
+  html)
+    parse "$@"
+    out="$(api /eval "$(jq -nc --arg id "$block" --arg s "${rest[0]:-}" \
+      '{id:$id, js:("(s => { const e = s ? document.querySelector(s) : document.documentElement; return e ? e.outerHTML : null; })(" + ($s | @json) + ")")}')" 60)"
+    [ "$(jq -r '.value | type' <<<"$out")" = string ] || die "no element for ${rest[0]:-the page}"
+    jq -r '.value' <<<"$out"
     ;;
 
   screenshot|shot)

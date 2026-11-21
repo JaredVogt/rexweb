@@ -207,9 +207,27 @@ final class OverlayWindow: NSWindow {
   override var canBecomeMain: Bool { true }
 }
 
+final class ConsoleRelay: NSObject, WKScriptMessageHandler {
+  weak var panel: Panel?
+
+  func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard let o = message.body as? [String: Any] else { return }
+    panel?.record(level: o["level"] as? String ?? "log", text: o["text"] as? String ?? "",
+                  url: o["url"] as? String ?? message.frameInfo.request.url?.absoluteString ?? "",
+                  source: o["source"] as? String)
+  }
+}
+
 final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
   let id: String
   let session: String
+  let relay = ConsoleRelay()
+  var console: [[String: Any]] = []
+  var consoleSeq = 0
+  var consoleDropped = 0
+
+  static let consoleLimit = 1000
+  static let consoleLevels: Set<String> = ["log", "info", "warn", "error", "debug", "navigation"]
   let window: OverlayWindow
   let web: WKWebView
   let bar = NSView()
@@ -238,6 +256,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     self.session = session
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = Panel.store
+    conf.userContentController.addUserScript(WKUserScript(source: JS.consoleHook, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+    conf.userContentController.add(relay, name: "rexwebConsole")
     conf.applicationNameForUserAgent = "Version/26.4 Safari/605.1.15"
     conf.preferences.isElementFullscreenEnabled = true
     conf.allowsAirPlayForMediaPlayback = true
@@ -245,6 +265,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     window = OverlayWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                            styleMask: [.borderless], backing: .buffered, defer: false)
     super.init()
+    relay.panel = self
 
     window.isReleasedWhenClosed = false
     window.hasShadow = false
@@ -394,7 +415,26 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     urlField.currentEditor()?.selectAll(nil)
   }
 
+  func record(level: String, text: String, url: String, source: String? = nil) {
+    consoleSeq += 1
+    var entry: [String: Any] = [
+      "seq": consoleSeq, "time": Date().timeIntervalSince1970,
+      "level": Panel.consoleLevels.contains(level) ? level : "log",
+      "text": String(text.prefix(8000)), "url": String(url.prefix(2000)),
+    ]
+    if let source, !source.isEmpty { entry["source"] = String(source.prefix(2000)) }
+    console.append(entry)
+    if console.count > Panel.consoleLimit {
+      consoleDropped += console.count - Panel.consoleLimit
+      console.removeFirst(console.count - Panel.consoleLimit)
+    }
+  }
+
   func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { lastError = nil }
+  func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+    guard webView === web else { return }
+    record(level: "navigation", text: "Navigated to \(webView.url?.absoluteString ?? "")", url: webView.url?.absoluteString ?? "")
+  }
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { lastError = nil; finishWaiters(nil); updateChrome() }
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
@@ -403,6 +443,8 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     let e = error as NSError
     if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
     lastError = e.localizedDescription
+    let failing = (e.userInfo[NSURLErrorFailingURLStringErrorKey] as? String) ?? web.url?.absoluteString ?? ""
+    record(level: "error", text: "Page failed to load: \(e.localizedDescription)", url: failing)
     finishWaiters(lastError)
   }
 
@@ -454,6 +496,7 @@ final class Panel: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDele
     popups.forEach { $0.window.close() }
     popups = []
     finishWaiters("closed")
+    web.configuration.userContentController.removeScriptMessageHandler(forName: "rexwebConsole")
     for k in ["title", "URL", "canGoBack", "canGoForward"] { web.removeObserver(self, forKeyPath: k) }
     window.orderOut(nil)
     window.close()
@@ -703,9 +746,27 @@ final class Tracker {
       guard layer == 0, owner == "Rex" || owner.hasPrefix("Rex ") else { continue }
       guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
             let r = CGRect(dictionaryRepresentation: bd), r.width > 200, r.height > 200 else { continue }
-      rex.append(RexWindow(number: n, name: w[kCGWindowName as String] as? String ?? "", bounds: r))
+      guard onScreenFraction(r) >= 0.5 else { continue }
+      let name = w[kCGWindowName as String] as? String ?? ""
+      if let twin = rex.firstIndex(where: { $0.bounds == r }) {
+        if rex[twin].name.isEmpty { rex[twin] = RexWindow(number: rex[twin].number, name: name, bounds: r) }
+        continue
+      }
+      rex.append(RexWindow(number: n, name: name, bounds: r))
     }
     return (rex, order)
+  }
+
+  static func onScreenFraction(_ r: CGRect) -> Double {
+    var count: UInt32 = 0
+    var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+    guard CGGetActiveDisplayList(16, &displays, &count) == .success, count > 0 else { return 1 }
+    var area = 0.0
+    for d in displays.prefix(Int(count)) {
+      let shared = CGDisplayBounds(d).intersection(r)
+      if !shared.isNull { area += Double(shared.width * shared.height) }
+    }
+    return area / Double(r.width * r.height)
   }
 
   static func placement(of id: String, in view: [String: Any]) -> (rect: CGRect, floating: Bool)? {
@@ -1004,6 +1065,63 @@ enum JS {
     try { return JSON.parse(JSON.stringify(__v === undefined ? null : __v)); } catch (e) { return String(__v); }
     """
   }
+
+  static let consoleHook = #"""
+  (() => {
+    const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.rexwebConsole;
+    if (!handler) return;
+    const post = handler.postMessage.bind(handler);
+    const send = (level, text, source) => {
+      try { post({ level, text: String(text).slice(0, 8000), url: location.href, source: source || '' }); } catch (e) {}
+    };
+    const fmt = v => {
+      if (typeof v === 'string') return v;
+      if (v === undefined) return 'undefined';
+      if (v === null) return 'null';
+      if (typeof v === 'function') return '[function ' + (v.name || 'anonymous') + ']';
+      if (typeof v === 'symbol' || typeof v === 'bigint') return v.toString();
+      if (v instanceof Error) {
+        const head = (v.name || 'Error') + ': ' + v.message;
+        return v.stack ? head + '\n' + String(v.stack).split('\n').map(l => '    at ' + l).join('\n') : head;
+      }
+      if (typeof Node !== 'undefined' && v instanceof Node) {
+        return v.nodeType === 1 ? v.cloneNode(false).outerHTML.slice(0, 300) : v.nodeName;
+      }
+      if (typeof v === 'object') {
+        try {
+          const seen = new WeakSet();
+          const out = JSON.stringify(v, (k, x) => {
+            if (typeof x === 'object' && x !== null) { if (seen.has(x)) return '[circular]'; seen.add(x); }
+            if (typeof x === 'bigint') return x.toString();
+            if (typeof x === 'function') return '[function]';
+            return x;
+          });
+          if (out !== undefined) return out;
+        } catch (e) {}
+      }
+      try { return String(v); } catch (e) { return '[unprintable]'; }
+    };
+    for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+      const original = console[level];
+      console[level] = function (...args) {
+        send(level, args.map(fmt).join(' '));
+        return original.apply(this, args);
+      };
+    }
+    addEventListener('error', e => {
+      const t = e.target;
+      if (t && t !== window && t.tagName) {
+        send('error', 'Failed to load <' + t.tagName.toLowerCase() + '> ' + (t.currentSrc || t.src || t.href || ''));
+      } else {
+        send('error', 'Uncaught ' + (e.error ? fmt(e.error) : e.message), e.filename ? e.filename + ':' + e.lineno + ':' + e.colno : '');
+      }
+    }, true);
+    addEventListener('unhandledrejection', e => send('error', 'Unhandled promise rejection: ' + fmt(e.reason)));
+    document.addEventListener('securitypolicyviolation', e => {
+      send('error', 'Blocked by Content Security Policy (' + e.violatedDirective + '): ' + (e.blockedURI || 'inline'), e.sourceFile ? e.sourceFile + ':' + e.lineNumber : '');
+    });
+  })();
+  """#
 
   static let exists = #"""
   if (args.selector) return !!document.querySelector(args.selector);
@@ -1344,6 +1462,17 @@ final class App: NSObject, NSApplicationDelegate {
         if !e.contains("SyntaxError") && !e.contains("Unexpected") { return fail(e) }
         self.js(p, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
       }
+    case "/console":
+      let since = (input["since"] as? NSNumber)?.intValue ?? 0
+      let levels = Set(input["levels"] as? [String] ?? [])
+      if let bad = levels.first(where: { !Panel.consoleLevels.contains($0) }) {
+        return fail("unknown level \(bad): use \(Panel.consoleLevels.sorted().joined(separator: ", "))")
+      }
+      var messages = p.console.filter { ($0["seq"] as? Int ?? 0) > since && (levels.isEmpty || levels.contains($0["level"] as? String ?? "")) }
+      if let limit = (input["limit"] as? NSNumber)?.intValue, limit > 0, messages.count > limit { messages = Array(messages.suffix(limit)) }
+      let result: [String: Any] = ["messages": messages, "last": p.consoleSeq, "dropped": p.consoleDropped]
+      if input["clear"] as? Bool == true { p.console = [] }
+      ok(result)
     case "/snapshot":
       let args: [String: Any] = ["max": input["max"] ?? 400, "textMax": input["text_max"] ?? 6000]
       func attempt(_ left: Int) {
