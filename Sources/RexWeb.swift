@@ -822,7 +822,6 @@ final class Tracker {
     let label = v["label"] as? String ?? ""
     if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
     if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
-    // An unlearned window can show any session, so guess only for the one Rex focused last.
     guard p.session == focusedSession else { return nil }
     let free = rexWins.filter { windowSession[$0.number] == nil }
     if free.count == 1 { return free[0] }
