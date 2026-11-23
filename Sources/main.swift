@@ -1,6 +1,6 @@
 import AppKit
 
-Engine.make = { WebKitEngine(panel: $0) }
+Engine.make = { WebKitEngine(tab: $0) }
 Engine.setCookies = WebKitEngine.setCookies
 
 let app = NSApplication.shared

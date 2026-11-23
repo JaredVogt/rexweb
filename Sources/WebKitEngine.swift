@@ -2,11 +2,11 @@ import AppKit
 import WebKit
 
 final class ConsoleRelay: NSObject, WKScriptMessageHandler {
-  weak var panel: Panel?
+  weak var tab: Tab?
 
   func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
     guard let o = message.body as? [String: Any] else { return }
-    panel?.record(level: o["level"] as? String ?? "log", text: o["text"] as? String ?? "",
+    tab?.record(level: o["level"] as? String ?? "log", text: o["text"] as? String ?? "",
                   url: o["url"] as? String ?? message.frameInfo.request.url?.absoluteString ?? "",
                   source: o["source"] as? String)
   }
@@ -21,7 +21,7 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     group.notify(queue: .main, execute: done)
   }
 
-  weak var panel: Panel?
+  weak var tab: Tab?
   let web: WKWebView
   let relay = ConsoleRelay()
   var popups: [Popup] = []
@@ -37,8 +37,8 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     set { web.pageZoom = CGFloat(newValue) }
   }
 
-  init(panel: Panel) {
-    self.panel = panel
+  init(tab: Tab) {
+    self.tab = tab
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = WebKitEngine.store
     conf.userContentController.addUserScript(WKUserScript(source: JS.consoleHook, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -48,7 +48,7 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     conf.allowsAirPlayForMediaPlayback = true
     web = WKWebView(frame: .zero, configuration: conf)
     super.init()
-    relay.panel = panel
+    relay.tab = tab
 
     web.navigationDelegate = self
     web.uiDelegate = self
@@ -61,7 +61,7 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
   static let observed = ["title", "URL", "canGoBack", "canGoForward"]
 
   override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-    panel?.engineChanged()
+    tab?.engineChanged()
   }
 
   func load(_ url: URL) {
@@ -137,12 +137,12 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     for k in WebKitEngine.observed { web.removeObserver(self, forKeyPath: k) }
   }
 
-  func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { panel?.engineStarted() }
+  func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { tab?.engineStarted() }
   func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
     guard webView === web else { return }
-    panel?.engineCommitted()
+    tab?.engineCommitted()
   }
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { panel?.engineFinished() }
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { tab?.engineFinished() }
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failed(error) }
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failed(error) }
 
@@ -150,7 +150,7 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     let e = error as NSError
     if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
     let failing = (e.userInfo[NSURLErrorFailingURLStringErrorKey] as? String) ?? web.url?.absoluteString ?? ""
-    panel?.engineFailed(e.localizedDescription, url: failing)
+    tab?.engineFailed(e.localizedDescription, url: failing)
   }
 
   func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
@@ -171,7 +171,7 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
     if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
        navigationAction.navigationType == .linkActivated {
-      panel?.openBeside(url.absoluteString)
+      tab?.openBeside(url.absoluteString)
       decisionHandler(.cancel)
       return
     }

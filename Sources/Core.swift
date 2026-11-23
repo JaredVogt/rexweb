@@ -15,6 +15,8 @@ struct Config {
   var searchURL = "https://www.google.com/search?q=%s"
   var fallbackBrowser = ""
   var linkTarget = "split"
+  /// Minutes a background tab may sit unused before it is unloaded. 0 turns unloading off.
+  var tabUnloadMinutes = 30.0
   var rexBin = ""
   var configError: String?
 
@@ -59,6 +61,9 @@ struct Config {
       if u.contains("%s") { c.searchURL = u } else { c.configError = "search_url needs %s where the query goes" }
     }
     if let f = o["fallback_browser"] as? String { c.fallbackBrowser = f }
+    if let m = n("tab_unload_minutes") {
+      if m >= 0 { c.tabUnloadMinutes = m } else { c.configError = "tab_unload_minutes must be 0 (off) or more" }
+    }
     if let t = o["links"] as? String {
       if ["tab", "split"].contains(t) { c.linkTarget = t } else { c.configError = "links must be \"split\" or \"tab\"" }
     }
@@ -262,31 +267,334 @@ protocol PageEngine: AnyObject {
 enum Engine {
   static var name = "webkit"
   static var label = "WebKit"
-  static var make: (Panel) -> PageEngine = { _ in fatalError("no page engine registered") }
+  static var make: (Tab) -> PageEngine = { _ in fatalError("no page engine registered") }
   static var setCookies: ([HTTPCookie], @escaping () -> Void) -> Void = { _, done in done() }
   /// Routes only one engine has. Returns false when the route isn't its own.
-  static var route: ((String, Panel, [String: Any], @escaping (Int, Any) -> Void) -> Bool)?
+  static var route: ((String, Tab, [String: Any], @escaping (Int, Any) -> Void) -> Bool)?
+  /// API routes that only work while their tab is the one on show. A command
+  /// on one of these routes aimed at a background tab selects the tab, waits
+  /// a moment, runs, and puts the earlier tab back after it replies. Each app
+  /// sets this for its engine; a route left out runs on the hidden tab.
+  static var needsVisible: Set<String> = ["/click", "/type", "/press", "/shot"]
+}
+
+/// One page in a pane. A pane always has at least one tab, and shows one.
+///
+/// A tab is either live, with a page engine, or asleep: only its address,
+/// title and console log are kept. Tabs restored after a restart start asleep,
+/// and background tabs left unused go to sleep to give their memory back.
+/// Reading `engine` wakes a tab. Code that only lists tabs must use `url`,
+/// `title`, `isLive` and `live`, which never wake one.
+final class Tab {
+  let id: String
+  private(set) weak var panel: Panel?
+  /// The engine, when the tab is awake. Reading this never wakes the tab.
+  private(set) var live: PageEngine?
+  private(set) var closed = false
+  var console: [[String: Any]] = []
+  var consoleSeq = 0
+  var consoleDropped = 0
+  var loadWaiters: [(String?) -> Void] = []
+  var lastError: String?
+  var requested: URL?
+  /// When the tab was last selected or addressed by an API command.
+  var lastUsed = Date()
+  /// What a sleeping tab shows and reloads.
+  private(set) var savedURL: String
+  private(set) var savedTitle: String
+
+  init(panel: Panel, id: String, url: String = "", title: String = "", asleep: Bool = false) {
+    self.panel = panel
+    self.id = id
+    savedURL = url
+    savedTitle = title
+    if !asleep { live = Engine.make(self) }
+  }
+
+  var isLive: Bool { live != nil && !closed }
+  var isActive: Bool { panel?.activeTab === self }
+  /// The tab is the one on show in a pane that is on screen.
+  var visible: Bool { (panel?.visible ?? false) && isActive }
+  /// The page's address. While a first load is still on its way, the address asked for.
+  var url: String {
+    guard let live else { return savedURL }
+    let now = live.url?.absoluteString ?? ""
+    if now.isEmpty || now == "about:blank", let r = requested, isLoading { return r.absoluteString }
+    return live.url == nil ? savedURL : now
+  }
+  var title: String { live.map { $0.title } ?? savedTitle }
+  var isLoading: Bool { isLive && (live?.isLoading ?? false) }
+
+  /// The tab's page engine. Wakes the tab if it is asleep: makes the engine,
+  /// puts its view in the pane, and loads the saved address.
+  var engine: PageEngine {
+    if let live { return live }
+    let made = Engine.make(self)
+    live = made
+    // A closed tab can still be reached by a reply that was waiting on it.
+    // Hand that an engine that does nothing.
+    if closed { made.close(); return made }
+    panel?.attach(self)
+    if !savedURL.isEmpty, let u = URL(string: savedURL) {
+      requested = u
+      made.load(u)
+    }
+    panel?.tabChanged(self)
+    return made
+  }
+
+  /// Gives the page's memory back. The address, title and console log stay;
+  /// the page's history and, on Chromium, its network log go with the engine.
+  func sleep() {
+    guard let engine = live, !closed, !isActive else { return }
+    savedURL = engine.url?.absoluteString ?? savedURL
+    savedTitle = engine.title.isEmpty ? savedTitle : engine.title
+    finishWaiters("the tab was unloaded")
+    engine.view.removeFromSuperview()
+    engine.close()
+    live = nil
+    lastError = nil
+    record(level: "navigation", text: "Tab unloaded to save memory. It reloads when used.", url: savedURL)
+  }
+
+  func info() -> [String: Any] {
+    ["id": panel?.id ?? "", "session": panel?.session ?? "", "url": url, "title": title,
+     "loading": isLoading, "visible": panel?.visible ?? false, "error": orNull(lastError), "engine": Engine.name,
+     "label": panel?.lastLabel ?? "", "active": (panel?.lastActive ?? Date()).timeIntervalSince1970,
+     "tab": id, "tab_index": (panel?.tabs.firstIndex { $0 === self } ?? 0) + 1, "tabs": panel?.tabs.count ?? 0,
+     "tab_active": isActive, "tab_asleep": !isLive]
+  }
+
+  /// Loads an address. On a sleeping tab this makes the engine and loads the
+  /// new address only, not the saved one first.
+  func load(_ raw: String, done: ((String?) -> Void)? = nil) {
+    guard let url = Panel.normalize(raw) else { done?("bad url"); return }
+    if closed { done?("closed"); return }
+    requested = url
+    if let done { loadWaiters.append(done) }
+    if let live {
+      live.load(url)
+    } else {
+      savedURL = url.absoluteString
+      _ = engine
+    }
+  }
+
+  var refusedError: String? {
+    guard let live, let req = requested, req.scheme != "about", live.url == nil || live.url?.absoluteString == "about:blank" else { return nil }
+    return "\(Engine.label) didn't load \(req.absoluteString). Its port may be one \(Engine.label) blocks"
+  }
+
+  func waitForLoad(_ done: @escaping (String?) -> Void) {
+    if !engine.isLoading { done(lastError ?? refusedError); return }
+    loadWaiters.append(done)
+  }
+
+  func finishWaiters(_ err: String?) {
+    let w = loadWaiters
+    loadWaiters = []
+    w.forEach { $0(err) }
+  }
+
+  /// While set, drops the "Script error." that eval's expression-first attempt
+  /// raises when the code turns out to be statements.
+  var probingUntil = Date.distantPast
+
+  func record(level: String, text: String, url: String, source: String? = nil) {
+    if level == "error", text == "Uncaught Script error.", Date() < probingUntil { return }
+    consoleSeq += 1
+    var entry: [String: Any] = [
+      "seq": consoleSeq, "time": Date().timeIntervalSince1970,
+      "level": Panel.consoleLevels.contains(level) ? level : "log",
+      "text": String(text.prefix(8000)), "url": String(url.prefix(2000)),
+    ]
+    if let source, !source.isEmpty { entry["source"] = String(source.prefix(2000)) }
+    console.append(entry)
+    if console.count > Panel.consoleLimit {
+      consoleDropped += console.count - Panel.consoleLimit
+      console.removeFirst(console.count - Panel.consoleLimit)
+    }
+  }
+
+  // Called by the engine.
+
+  func engineChanged() { panel?.tabChanged(self) }
+  func engineStarted() { lastError = nil }
+  func engineCommitted(_ url: String? = nil) {
+    let u = url ?? live?.url?.absoluteString ?? ""
+    record(level: "navigation", text: "Navigated to \(u)", url: u)
+    panel?.tabChanged(self)
+  }
+  func engineFinished() { lastError = nil; finishWaiters(nil); panel?.tabChanged(self) }
+  func engineFailed(_ message: String, url: String) {
+    lastError = message
+    record(level: "error", text: "Page failed to load: \(message)", url: url)
+    finishWaiters(lastError)
+  }
+
+  /// Opens `url` in a new tab of this tab's pane, placed right after this
+  /// tab. `foreground` shows the new tab; otherwise it loads behind this one.
+  /// The new tab is a separate page with no `window.opener`. Returns nil when
+  /// this tab's pane is gone.
+  @discardableResult
+  func openTab(_ url: String, foreground: Bool) -> Tab? {
+    panel?.newTab(url: url, foreground: foreground, after: self)
+  }
+
+  /// Opens `url` in a new browser pane to the right of this tab's pane, with
+  /// the same engine.
+  func openBeside(_ url: String) {
+    guard let panel else { return }
+    App.shared.openPane(beside: panel.id, session: panel.session, url: url)
+  }
+
+  func close() {
+    closed = true
+    finishWaiters("closed")
+    live?.view.removeFromSuperview()
+    live?.close()
+  }
+}
+
+/// The row of tabs above the address bar. Shown when a pane has two or more.
+final class TabStrip: NSView {
+  struct Item: Equatable { let title: String; let active: Bool; let asleep: Bool }
+
+  var onSelect: (Int) -> Void = { _ in }
+  var onClose: (Int) -> Void = { _ in }
+  var onNew: () -> Void = {}
+  private var items: [Item] = []
+  private var cells: [TabCell] = []
+  private let plus = NSButton()
+
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    plus.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "New Tab")
+    plus.imageScaling = .scaleProportionallyDown
+    plus.bezelStyle = .accessoryBarAction
+    plus.isBordered = false
+    plus.toolTip = "New Tab"
+    plus.target = self
+    plus.action = #selector(newTab)
+    addSubview(plus)
+  }
+  required init?(coder: NSCoder) { fatalError("not used") }
+
+  @objc func newTab() { onNew() }
+
+  /// Redraws only when something a person can see has changed.
+  func show(_ new: [Item]) {
+    guard new != items else { return }
+    if new.count == cells.count {
+      for (i, item) in new.enumerated() where item != items[i] { cells[i].show(item) }
+    } else {
+      cells.forEach { $0.removeFromSuperview() }
+      cells = new.enumerated().map { i, item in
+        let c = TabCell()
+        c.show(item)
+        c.onSelect = { [weak self] in self?.onSelect(i) }
+        c.onClose = { [weak self] in self?.onClose(i) }
+        addSubview(c)
+        return c
+      }
+      needsLayout = true
+    }
+    items = new
+  }
+
+  override func layout() {
+    super.layout()
+    let plusWidth: CGFloat = 26
+    let room = max(0, bounds.width - plusWidth - 10)
+    let w = cells.isEmpty ? 0 : min(200, max(44, room / CGFloat(cells.count)))
+    for (i, c) in cells.enumerated() { c.frame = NSRect(x: 6 + CGFloat(i) * w, y: 2, width: w - 2, height: bounds.height - 4) }
+    plus.frame = NSRect(x: min(bounds.width - plusWidth, 6 + CGFloat(cells.count) * w + 2), y: 2, width: 22, height: bounds.height - 4)
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    for (i, c) in cells.enumerated() where i < items.count { c.show(items[i]) }
+  }
+}
+
+final class TabCell: NSView {
+  var onSelect: () -> Void = {}
+  var onClose: () -> Void = {}
+  private let label = NSTextField(labelWithString: "")
+  private let closeButton = NSButton()
+
+  override init(frame: NSRect) {
+    super.init(frame: frame)
+    wantsLayer = true
+    layer?.cornerRadius = 5
+    label.font = .systemFont(ofSize: 11)
+    label.lineBreakMode = .byTruncatingTail
+    addSubview(label)
+    closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close Tab")
+    closeButton.imageScaling = .scaleProportionallyDown
+    closeButton.bezelStyle = .accessoryBarAction
+    closeButton.isBordered = false
+    closeButton.toolTip = "Close Tab"
+    closeButton.target = self
+    closeButton.action = #selector(close)
+    addSubview(closeButton)
+  }
+  required init?(coder: NSCoder) { fatalError("not used") }
+
+  func show(_ item: TabStrip.Item) {
+    label.stringValue = item.title
+    label.textColor = item.active ? .labelColor : (item.asleep ? .tertiaryLabelColor : .secondaryLabelColor)
+    toolTip = item.asleep ? "\(item.title) (unloaded; click to reload)" : item.title
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      layer?.backgroundColor = item.active ? NSColor.labelColor.withAlphaComponent(0.12).cgColor : NSColor.clear.cgColor
+    }
+  }
+
+  override func layout() {
+    super.layout()
+    let showClose = bounds.width >= 60
+    closeButton.isHidden = !showClose
+    closeButton.frame = NSRect(x: bounds.width - 20, y: (bounds.height - 14) / 2, width: 14, height: 14)
+    label.frame = NSRect(x: 8, y: (bounds.height - 15) / 2, width: max(0, bounds.width - (showClose ? 30 : 12)), height: 15)
+  }
+
+  /// The label would swallow clicks meant for the tab.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    guard let hit = super.hitTest(point) else { return nil }
+    return hit === closeButton ? hit : self
+  }
+
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  @objc func close() { onClose() }
+  override func mouseDown(with event: NSEvent) { onSelect() }
+  override func otherMouseDown(with event: NSEvent) { if event.buttonNumber == 2 { onClose() } }
 }
 
 final class Panel: NSObject, NSTextFieldDelegate {
   let id: String
   let session: String
-  var engine: PageEngine!
-  var console: [[String: Any]] = []
-  var consoleSeq = 0
-  var consoleDropped = 0
+  private(set) var tabs: [Tab] = []
+  /// The tab on show. It is always live.
+  private(set) var activeTab: Tab!
+  private var tabCounter = 0
+  /// The pane was built from a saved tab list rather than started empty.
+  private(set) var restored = false
+  /// Set while a command has a background tab on show for a moment. See `Engine.needsVisible`.
+  var borrow: (from: Tab, to: Tab, count: Int, token: Int)?
+
+  /// The engine of the tab on show.
+  var engine: PageEngine { activeTab.engine }
 
   static let consoleLimit = 1000
   static let consoleLevels: Set<String> = ["log", "info", "warn", "error", "debug", "navigation"]
   let window: OverlayWindow
+  let strip = TabStrip()
   let bar = NSView()
   let urlField = NSTextField()
   let backButton = NSButton()
   let forwardButton = NSButton()
   let reloadButton = NSButton()
-  var loadWaiters: [(String?) -> Void] = []
-  var lastError: String?
-  var requested: URL?
   var lastLabel = ""
   var visible = false
   var lastFrame = NSRect.zero
@@ -298,14 +606,15 @@ final class Panel: NSObject, NSTextFieldDelegate {
   var focusURLWhenShown = false
 
   static let barHeight: CGFloat = 30
+  static let stripHeight: CGFloat = 26
 
-  init(id: String, session: String) {
+  /// `restore` is a saved tab list, as `savedState` writes it.
+  init(id: String, session: String, restore: [String: Any]? = nil) {
     self.id = id
     self.session = session
     window = OverlayWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                            styleMask: [.borderless], backing: .buffered, defer: false)
     super.init()
-    engine = Engine.make(self)
 
     window.isReleasedWhenClosed = false
     window.hasShadow = false
@@ -343,8 +652,38 @@ final class Panel: NSObject, NSTextFieldDelegate {
     urlField.action = #selector(submitURL)
     bar.addSubview(urlField)
 
+    strip.onSelect = { [weak self] i in
+      guard let self, i < self.tabs.count else { return }
+      self.select(self.tabs[i])
+      self.engine.focus()
+    }
+    strip.onClose = { [weak self] i in
+      guard let self, i < self.tabs.count else { return }
+      self.closeTab(self.tabs[i])
+    }
+    strip.onNew = { [weak self] in self?.newTabFromUI() }
+    strip.isHidden = true
+    root.addSubview(strip)
     root.addSubview(bar)
-    root.addSubview(engine.view)
+
+    // Blank tabs aren't worth bringing back; the tab on show moves to the
+    // nearest one before it that is.
+    let saved = restore?["tabs"] as? [[String: Any]] ?? []
+    let wanted = (restore?["active"] as? NSNumber)?.intValue ?? 0
+    var chosen = 0
+    for (i, s) in saved.enumerated() {
+      let url = s["url"] as? String ?? ""
+      if url.isEmpty || url == "about:blank" { continue }
+      if i <= wanted { chosen = tabs.count }
+      _ = makeTab(url: url, title: s["title"] as? String ?? "", asleep: true)
+    }
+    if tabs.isEmpty {
+      activeTab = makeTab()
+    } else {
+      restored = true
+      activeTab = tabs[chosen]
+    }
+    activeTab.engine.view.isHidden = false
     layout()
     NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: window, queue: .main) { [weak self] _ in
       self?.layout()
@@ -354,28 +693,179 @@ final class Panel: NSObject, NSTextFieldDelegate {
       self.lastActive = Date()
       Rex.async(["focus", "-s", self.session, self.id])
     }
-    updateChrome()
+    tabsChanged()
   }
+
+  // MARK: Tabs
+
+  private func makeTab(url: String = "", title: String = "", asleep: Bool = false, at index: Int? = nil) -> Tab {
+    tabCounter += 1
+    let t = Tab(panel: self, id: "t\(tabCounter)", url: url, title: title, asleep: asleep)
+    tabs.insert(t, at: min(index ?? tabs.count, tabs.count))
+    if t.isLive { attach(t) }
+    return t
+  }
+
+  /// Puts a live tab's view in the pane, hidden unless the tab is on show.
+  func attach(_ t: Tab) {
+    guard let root = window.contentView, let view = t.live?.view, tabs.contains(where: { $0 === t }) else { return }
+    view.isHidden = !(activeTab === t)
+    if view.superview !== root { root.addSubview(view, positioned: .below, relativeTo: bar) }
+    layout()
+  }
+
+  /// Finds a tab by its ID, such as t3, or by its position counted from 1.
+  /// Nothing means the tab on show.
+  func tab(_ raw: Any?) -> Tab? {
+    let s = (raw as? String) ?? (raw as? NSNumber)?.stringValue ?? ""
+    if s.isEmpty { return activeTab }
+    if let t = tabs.first(where: { $0.id == s }) { return t }
+    if let n = Int(s), n >= 1, n <= tabs.count { return tabs[n - 1] }
+    return nil
+  }
+
+  /// Adds a tab, after `after` or at the end, and loads `url` in it if given.
+  @discardableResult
+  func newTab(url: String, foreground: Bool, after: Tab? = nil) -> Tab {
+    let index = after.flatMap { a in tabs.firstIndex { $0 === a } }.map { $0 + 1 }
+    let t = makeTab(at: index)
+    if !url.isEmpty { t.load(url) }
+    if foreground { select(t) } else { tabsChanged() }
+    return t
+  }
+
+  func newTabFromUI() {
+    newTab(url: "", foreground: true)
+    focusURL()
+  }
+
+  /// Shows a tab, waking it if it is asleep. `transient` is for a command
+  /// that borrows the pane for a moment: it leaves a half-typed address alone.
+  func select(_ t: Tab, transient: Bool = false) {
+    guard tabs.contains(where: { $0 === t }) else { return }
+    t.lastUsed = Date()
+    if !transient { borrow = nil }
+    guard let old = activeTab, old !== t else { return }
+    old.lastUsed = Date()
+    let editing = editingURL
+    if editing, !transient { urlField.abortEditing() }
+    activeTab = t
+    let view = t.engine.view
+    old.live?.view.isHidden = true
+    view.isHidden = false
+    layout()
+    // Keys sent to the window go to its first responder, which must not stay
+    // the page that was just hidden. This doesn't bring the window forward.
+    if !editing || !transient { t.engine.focus() }
+    tabsChanged()
+  }
+
+  /// The address field has the keyboard.
+  var editingURL: Bool { urlField.currentEditor() != nil && window.firstResponder === urlField.currentEditor() }
+
+  func selectNext(_ step: Int) {
+    guard tabs.count > 1, let i = tabs.firstIndex(where: { $0 === activeTab }) else { return }
+    select(tabs[(i + step + tabs.count) % tabs.count])
+    engine.focus()
+  }
+
+  /// Closes a tab. Closing the last one closes the pane.
+  func closeTab(_ t: Tab) {
+    guard let i = tabs.firstIndex(where: { $0 === t }) else { return }
+    if tabs.count == 1 { Rex.async(["block", "close", id]); return }
+    if let b = borrow, b.from === t || b.to === t { borrow = nil }
+    tabs.remove(at: i)
+    if activeTab === t {
+      let editing = editingURL
+      if editing { urlField.abortEditing() }
+      activeTab = tabs[min(i, tabs.count - 1)]
+      activeTab.lastUsed = Date()
+      t.close()
+      activeTab.engine.view.isHidden = false
+      activeTab.engine.focus()
+    } else {
+      t.close()
+    }
+    tabsChanged()
+  }
+
+  /// A tab's address, title or load state changed.
+  func tabChanged(_ t: Tab) {
+    if t === activeTab { updateChrome() }
+    refreshStrip()
+    App.shared.saveTabsSoon()
+  }
+
+  /// The set of tabs, their order, or the one on show changed.
+  func tabsChanged() {
+    updateChrome()
+    refreshStrip()
+    layout()
+    App.shared.saveTabsSoon()
+  }
+
+  func refreshStrip() {
+    strip.isHidden = tabs.count < 2
+    strip.show(tabs.map { t in
+      let title = t.title.isEmpty ? (URL(string: t.url)?.host ?? (t.url.isEmpty || t.url == "about:blank" ? "New Tab" : t.url)) : t.title
+      return TabStrip.Item(title: String(title.prefix(60)), active: t === activeTab, asleep: !t.isLive)
+    })
+    layout()
+  }
+
+  /// Puts background tabs nobody has used for `minutes` to sleep.
+  func sleepIdleTabs(olderThan minutes: Double) {
+    let cutoff = Date().addingTimeInterval(-minutes * 60)
+    var slept = false
+    for t in tabs where t.isLive && !t.isActive && t.lastUsed < cutoff && !t.isLoading && t.loadWaiters.isEmpty {
+      if let b = borrow, b.from === t || b.to === t { continue }
+      t.sleep()
+      slept = true
+    }
+    if slept { refreshStrip() }
+  }
+
+  /// What session restore keeps for this pane.
+  var savedState: (active: Int, tabs: [[String: String]]) {
+    (tabs.firstIndex { $0 === activeTab } ?? 0, tabs.map { ["url": $0.url, "title": $0.title] })
+  }
+
+  func tabsInfo() -> [String: Any] {
+    ["id": id, "active": activeTab.id, "tabs": tabs.enumerated().map { i, t -> [String: Any] in
+      ["id": t.id, "index": i + 1, "url": t.url, "title": t.title, "active": t === activeTab,
+       "asleep": !t.isLive, "loading": t.isLoading]
+    }]
+  }
+
+  // MARK: Layout and chrome
+
+  /// Sets a frame only when it differs, so a call that changes nothing repaints nothing.
+  private func place(_ v: NSView, _ r: NSRect) { if v.frame != r { v.frame = r } }
 
   func layout() {
     guard let root = window.contentView else { return }
     let b = root.bounds
     let h = Panel.barHeight
-    bar.frame = NSRect(x: 0, y: b.height - h, width: b.width, height: h)
-    backButton.frame = NSRect(x: 6, y: 4, width: 24, height: 22)
-    forwardButton.frame = NSRect(x: 30, y: 4, width: 24, height: 22)
-    reloadButton.frame = NSRect(x: 54, y: 4, width: 24, height: 22)
-    urlField.frame = NSRect(x: 84, y: 4, width: max(40, b.width - 92), height: 22)
-    engine.view.frame = NSRect(x: 0, y: 0, width: b.width, height: max(0, b.height - h))
+    let s = strip.isHidden ? 0 : Panel.stripHeight
+    place(strip, NSRect(x: 0, y: b.height - s, width: b.width, height: s))
+    place(bar, NSRect(x: 0, y: b.height - s - h, width: b.width, height: h))
+    place(backButton, NSRect(x: 6, y: 4, width: 24, height: 22))
+    place(forwardButton, NSRect(x: 30, y: 4, width: 24, height: 22))
+    place(reloadButton, NSRect(x: 54, y: 4, width: 24, height: 22))
+    place(urlField, NSRect(x: 84, y: 4, width: max(40, b.width - 92), height: 22))
+    let page = NSRect(x: 0, y: 0, width: b.width, height: max(0, b.height - h - s))
+    for t in tabs { if let v = t.live?.view { place(v, page) } }
   }
 
   func updateChrome() {
-    backButton.isEnabled = engine.canGoBack
-    forwardButton.isEnabled = engine.canGoForward
-    if window.firstResponder != urlField.currentEditor() {
-      urlField.stringValue = engine.url?.absoluteString ?? ""
+    guard let t = activeTab else { return }
+    let back = t.live?.canGoBack ?? false, forward = t.live?.canGoForward ?? false
+    if backButton.isEnabled != back { backButton.isEnabled = back }
+    if forwardButton.isEnabled != forward { forwardButton.isEnabled = forward }
+    if window.firstResponder != urlField.currentEditor(), urlField.stringValue != t.url {
+      urlField.stringValue = t.url
     }
-    guard let title = (engine.title.isEmpty ? engine.url?.host : engine.title), !title.isEmpty else { return }
+    guard let title = (t.title.isEmpty ? URL(string: t.url)?.host : t.title), !title.isEmpty else { return }
     let label = String(title.prefix(80))
     if label != lastLabel {
       lastLabel = label
@@ -383,11 +873,7 @@ final class Panel: NSObject, NSTextFieldDelegate {
     }
   }
 
-  func info() -> [String: Any] {
-    ["id": id, "session": session, "url": engine.url?.absoluteString ?? "", "title": engine.title,
-     "loading": engine.isLoading, "visible": visible, "error": orNull(lastError), "engine": Engine.name, "label": lastLabel,
-     "active": lastActive.timeIntervalSince1970]
-  }
+  func info() -> [String: Any] { activeTab.info() }
 
   static func normalize(_ raw: String) -> URL? {
     let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -402,28 +888,7 @@ final class Panel: NSObject, NSTextFieldDelegate {
     return URL(string: config.searchURL.replacingOccurrences(of: "%s", with: q))
   }
 
-  func load(_ raw: String, done: ((String?) -> Void)? = nil) {
-    guard let url = Panel.normalize(raw) else { done?("bad url"); return }
-    requested = url
-    if let done { loadWaiters.append(done) }
-    engine.load(url)
-  }
-
-  var refusedError: String? {
-    guard let req = requested, req.scheme != "about", engine.url == nil || engine.url?.absoluteString == "about:blank" else { return nil }
-    return "\(Engine.label) didn't load \(req.absoluteString). Its port may be one \(Engine.label) blocks"
-  }
-
-  func waitForLoad(_ done: @escaping (String?) -> Void) {
-    if !engine.isLoading { done(lastError ?? refusedError); return }
-    loadWaiters.append(done)
-  }
-
-  func finishWaiters(_ err: String?) {
-    let w = loadWaiters
-    loadWaiters = []
-    w.forEach { $0(err) }
-  }
+  func load(_ raw: String, done: ((String?) -> Void)? = nil) { activeTab.load(raw, done: done) }
 
   @objc func goBack() { engine.goBack() }
   @objc func goForward() { engine.goForward() }
@@ -438,45 +903,9 @@ final class Panel: NSObject, NSTextFieldDelegate {
     urlField.currentEditor()?.selectAll(nil)
   }
 
-  /// While set, drops the "Script error." that eval's expression-first attempt
-  /// raises when the code turns out to be statements.
-  var probingUntil = Date.distantPast
-
-  func record(level: String, text: String, url: String, source: String? = nil) {
-    if level == "error", text == "Uncaught Script error.", Date() < probingUntil { return }
-    consoleSeq += 1
-    var entry: [String: Any] = [
-      "seq": consoleSeq, "time": Date().timeIntervalSince1970,
-      "level": Panel.consoleLevels.contains(level) ? level : "log",
-      "text": String(text.prefix(8000)), "url": String(url.prefix(2000)),
-    ]
-    if let source, !source.isEmpty { entry["source"] = String(source.prefix(2000)) }
-    console.append(entry)
-    if console.count > Panel.consoleLimit {
-      consoleDropped += console.count - Panel.consoleLimit
-      console.removeFirst(console.count - Panel.consoleLimit)
-    }
-  }
-
-  // Called by the engine.
-
-  func engineChanged() { updateChrome() }
-  func engineStarted() { lastError = nil }
-  func engineCommitted(_ url: String? = nil) {
-    let u = url ?? engine.url?.absoluteString ?? ""
-    record(level: "navigation", text: "Navigated to \(u)", url: u)
-  }
-  func engineFinished() { lastError = nil; finishWaiters(nil); updateChrome() }
-  func engineFailed(_ message: String, url: String) {
-    lastError = message
-    record(level: "error", text: "Page failed to load: \(message)", url: url)
-    finishWaiters(lastError)
-  }
-  func openBeside(_ url: String) { App.shared.openPane(beside: id, session: session, url: url) }
-
   func close() {
-    finishWaiters("closed")
-    engine.close()
+    borrow = nil
+    tabs.forEach { $0.close() }
     window.orderOut(nil)
     window.close()
   }
@@ -1237,6 +1666,7 @@ final class App: NSObject, NSApplicationDelegate {
     buildMenu()
     server.start()
     tracker.start()
+    startTabTimer()
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.key(e) == true ? nil : e }
     log("listening on 127.0.0.1:\(config.port)")
   }
@@ -1274,10 +1704,14 @@ final class App: NSObject, NSApplicationDelegate {
       case "=", "+": p.engine.zoom = min(3, p.engine.zoom + 0.1); return true
       case "-": p.engine.zoom = max(0.3, p.engine.zoom - 0.1); return true
       case "0": p.engine.zoom = 1; return true
-      case "w": Rex.async(["block", "close", p.id]); return true
+      case "t": p.newTabFromUI(); return true
+      case "w": p.closeTab(p.activeTab); return true
       default: break
       }
     }
+    // Tab is key code 48. Cmd-1 to Cmd-9 and Shift-Cmd-[ and ] are left to Rex.
+    if e.keyCode == 48, m == .control { p.selectNext(1); return true }
+    if e.keyCode == 48, m == [.control, .shift] { p.selectNext(-1); return true }
     if m == [.command, .shift], c == "r" { p.engine.reload(fromOrigin: true); return true }
     if m == [.command, .shift], c == "b" { openPane(beside: p.id, session: p.session, url: ""); return true }
     if m == [.control, .option] || m == [.control, .option, .function] || m == [.control, .option, .numericPad, .function] {
@@ -1319,6 +1753,72 @@ final class App: NSObject, NSApplicationDelegate {
                "--", "env", "REXWEB_FOCUS=true", "REXWEB_ENGINE=\(Engine.name)", pane, url])
   }
 
+  // MARK: Saved tabs
+
+  /// Each pane's tabs, by pane ID, as written to `tabs-<engine>.json`. It
+  /// also holds panes that haven't registered again since the app started.
+  lazy var savedTabs: [String: [String: Any]] = loadSavedTabs()
+  var savedTabsDirty = false
+  var saveScheduled = false
+  static let savedTabsMaxAge = 30.0 * 86400
+
+  var tabsFile: URL { Config.dir.appendingPathComponent("tabs-\(Engine.name).json") }
+
+  func loadSavedTabs() -> [String: [String: Any]] {
+    guard let data = try? Data(contentsOf: tabsFile),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else { return [:] }
+    let cutoff = Date().timeIntervalSince1970 - App.savedTabsMaxAge
+    let kept = o.filter { (($0.value["saved"] as? NSNumber)?.doubleValue ?? 0) > cutoff }
+    if kept.count != o.count { savedTabsDirty = true }
+    return kept
+  }
+
+  /// Writes the tab list about a second from now, however many changes arrive before then.
+  func saveTabsSoon() {
+    guard !saveScheduled else { return }
+    saveScheduled = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+      self?.saveScheduled = false
+      self?.saveTabs()
+    }
+  }
+
+  /// Writes the file only when a pane's tabs differ from what it holds, or a
+  /// pane's entry is a day old and needs its date renewed.
+  func saveTabs() {
+    let now = Date().timeIntervalSince1970
+    for p in panels.values {
+      let s = p.savedState
+      if let old = savedTabs[p.id], (old["active"] as? NSNumber)?.intValue == s.active,
+         (old["tabs"] as? [[String: String]]) == s.tabs,
+         now - ((old["saved"] as? NSNumber)?.doubleValue ?? 0) < 86400 { continue }
+      savedTabs[p.id] = ["active": s.active, "saved": now, "tabs": s.tabs]
+      savedTabsDirty = true
+    }
+    guard savedTabsDirty else { return }
+    guard let data = try? JSONSerialization.data(withJSONObject: savedTabs, options: [.sortedKeys]) else { return }
+    do {
+      try data.write(to: tabsFile, options: .atomic)
+      try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tabsFile.path)
+      savedTabsDirty = false
+    } catch { log("couldn't save tabs: \(error.localizedDescription)") }
+  }
+
+  func forgetTabs(_ id: String) {
+    if savedTabs.removeValue(forKey: id) != nil { savedTabsDirty = true; saveTabsSoon() }
+  }
+
+  /// Once a minute: unloads idle background tabs and keeps the saved tab list fresh.
+  func startTabTimer() {
+    Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+      guard let self else { return }
+      if config.tabUnloadMinutes > 0 {
+        for p in self.panels.values { p.sleepIdleTabs(olderThan: config.tabUnloadMinutes) }
+      }
+      self.saveTabs()
+    }
+  }
+
   func resolve(_ raw: Any?) -> Panel? {
     let s = (raw as? String) ?? ""
     if s.isEmpty { return panels.values.max { $0.lastActive < $1.lastActive } }
@@ -1327,9 +1827,12 @@ final class App: NSObject, NSApplicationDelegate {
     return m.count == 1 ? m[0] : nil
   }
 
-  func js(_ p: Panel, _ body: String, _ args: [String: Any], _ done: @escaping (Any?, String?) -> Void) {
-    p.engine.call(body, args, done)
+  func js(_ t: Tab, _ body: String, _ args: [String: Any], _ done: @escaping (Any?, String?) -> Void) {
+    t.engine.call(body, args, done)
   }
+
+  /// Routes that answer from what a sleeping tab keeps, or that wake it themselves.
+  static let noWake: Set<String> = ["/info", "/console", "/nav", "/open", "/focus"]
 
   func handle(path: String, input: [String: Any], reply: @escaping (Int, Any) -> Void) {
     let ok = { (v: Any) in reply(200, v) }
@@ -1352,12 +1855,14 @@ final class App: NSObject, NSApplicationDelegate {
     case "/register":
       guard let id = input["id"] as? String, let session = input["session"] as? String else { return fail("id and session required") }
       if let p = panels[id] { return ok(p.info()) }
-      let p = Panel(id: id, session: session)
+      // A pane that still has saved tabs is coming back after the app
+      // restarted. Its tabs win over the address the pane script sends.
+      let p = Panel(id: id, session: session, restore: savedTabs[id])
       panels[id] = p
       tracker.refresh(session)
-      if let url = input["url"] as? String, !url.isEmpty { p.load(url) }
-      log("pane \(id.suffix(6)) registered")
-      let url = input["url"] as? String ?? ""
+      let url = p.restored ? p.activeTab.url : (input["url"] as? String ?? "")
+      if !p.restored, !url.isEmpty { p.load(url) }
+      log("pane \(id.suffix(6)) registered\(p.restored ? " with \(p.tabs.count) saved tab(s)" : "")")
       if input["focus"] as? Bool == true {
         p.focusURLWhenShown = url.isEmpty
         self.focus(p)
@@ -1366,6 +1871,7 @@ final class App: NSObject, NSApplicationDelegate {
     case "/close":
       guard let id = input["id"] as? String else { return fail("id required") }
       closePanel(id)
+      forgetTabs(id)
       return ok(["closed": id])
     case "/cookies":
       let list = input["cookies"] as? [[String: Any]] ?? []
@@ -1397,7 +1903,14 @@ final class App: NSObject, NSApplicationDelegate {
           let (cookies, skipped) = try ChromeCookies.read(profile: profile, domains: domains)
           DispatchQueue.main.async {
             Engine.setCookies(cookies) {
-              let reloadIDs = input["reload"] as? Bool == true ? self.panels.values.map { p in p.engine.reload(fromOrigin: false); return p.id } : []
+              var reloadIDs: [String] = []
+              if input["reload"] as? Bool == true {
+                // Every live tab, not only the one on show. Sleeping tabs pick the cookies up when they wake.
+                for p in self.panels.values {
+                  for t in p.tabs { t.live?.reload(fromOrigin: false) }
+                  reloadIDs.append(p.id)
+                }
+              }
               ok(["imported": cookies.count, "skipped": skipped, "reloaded": reloadIDs])
             }
           }
@@ -1412,7 +1925,30 @@ final class App: NSObject, NSApplicationDelegate {
     guard let p = resolve(input["id"]) else {
       return fail(panels.isEmpty ? "no browser panes; open one with `rexweb open URL`" : "no single pane matches \(input["id"] ?? "")")
     }
-    if route != "/info" { p.lastActive = Date() }
+    guard let t = p.tab(input["tab"]) else {
+      return fail("no tab \(input["tab"] ?? "") in this pane. Use a tab ID such as t1, or a position from 1 to \(p.tabs.count)")
+    }
+    if route != "/info" { p.lastActive = Date(); t.lastUsed = Date() }
+
+    switch route {
+    case "/tabs":
+      return ok(p.tabsInfo())
+    case "/tab/new":
+      let url = input["url"] as? String ?? ""
+      if !url.isEmpty, Panel.normalize(url) == nil { return fail("bad url") }
+      let made = p.newTab(url: url, foreground: input["background"] as? Bool != true)
+      return ok(made.info())
+    case "/tab/select":
+      guard input["tab"] != nil else { return fail("tab required: a tab ID such as t1, or a position counted from 1") }
+      p.select(t)
+      return ok(t.info())
+    case "/tab/close":
+      let last = p.tabs.count == 1
+      p.closeTab(t)
+      return ok(["id": p.id, "closed": t.id, "pane_closed": last, "tabs": last ? 0 : p.tabs.count,
+                 "active": last ? NSNull() as Any : p.activeTab.id as Any])
+    default: break
+    }
 
     if ["/click", "/type", "/press"].contains(route), !p.visible {
       func retry(_ left: Int) {
@@ -1424,41 +1960,112 @@ final class App: NSObject, NSApplicationDelegate {
       }
       return retry(12)
     }
+
+    // A sleeping tab wakes and finishes loading before the command runs.
+    if !t.isLive, !App.noWake.contains(route) {
+      var input = input
+      input["tab"] = t.id
+      _ = t.engine
+      var went = false
+      let go = {
+        guard !went else { return }
+        went = true
+        // Waking reloaded the page already.
+        if route == "/reload" { return ok(t.info()) }
+        self.handle(path: path, input: input, reply: reply)
+      }
+      t.waitForLoad { _ in go() }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 30) { go() }
+      return
+    }
+
+    guard Engine.needsVisible.contains(route) else { return run(route, p, t, input, reply) }
+
+    // The command needs its tab on show. Wait for any other command that has
+    // borrowed the pane, then borrow it: select, pause, run, put back.
+    func whenFree(_ left: Int) {
+      if let b = p.borrow, b.to !== t {
+        if left == 0 { return fail("another command is still using this pane's visible tab. Try again.") }
+        return DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { whenFree(left - 1) }
+      }
+      guard p.tabs.contains(where: { $0 === t }) else { return fail("the tab was closed") }
+      if p.borrow != nil {
+        p.borrow!.count += 1
+        return run(route, p, t, input, returning(p, t, reply))
+      }
+      if t === p.activeTab { return run(route, p, t, input, reply) }
+      borrowSeq += 1
+      p.borrow = (from: p.activeTab, to: t, count: 1, token: borrowSeq)
+      p.select(t, transient: true)
+      let done = returning(p, t, reply)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.run(route, p, t, input, done) }
+    }
+    whenFree(300)
+  }
+
+  var borrowSeq = 0
+
+  /// Wraps a reply so that, once it is sent, a borrowed pane shows the tab it showed before.
+  func returning(_ p: Panel, _ t: Tab, _ reply: @escaping (Int, Any) -> Void) -> (Int, Any) -> Void {
+    guard let token = p.borrow?.token else { return reply }
+    var released = false
+    let release = { [weak p] in
+      guard !released else { return }
+      released = true
+      guard let p, var b = p.borrow, b.token == token else { return }
+      b.count -= 1
+      if b.count > 0 { p.borrow = b; return }
+      p.borrow = nil
+      if p.activeTab === b.to, p.tabs.contains(where: { $0 === b.from }) { p.select(b.from, transient: true) }
+    }
+    // A command that never replies must not hold the pane for good.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 60) { release() }
+    return { status, out in reply(status, out); release() }
+  }
+
+  /// Runs a page command on a live tab.
+  func run(_ route: String, _ p: Panel, _ t: Tab, _ input: [String: Any], _ reply: @escaping (Int, Any) -> Void) {
+    let ok = { (v: Any) in reply(200, v) }
+    let fail = { (s: String) in reply(400, ["error": s]) }
+
     switch route {
     case "/info":
-      ok(p.info())
+      ok(t.info())
     case "/loaded":
       var replied = false
       let timeout = (input["timeout"] as? NSNumber)?.doubleValue ?? 30
       DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-        if !replied { replied = true; reply(408, ["error": "the page was still loading after \(Int(timeout))s", "url": p.engine.url?.absoluteString ?? ""]) }
+        if !replied { replied = true; reply(408, ["error": "the page was still loading after \(Int(timeout))s", "url": t.url]) }
       }
-      p.waitForLoad { err in
+      t.waitForLoad { err in
         guard !replied else { return }
         replied = true
-        err == nil ? ok(p.info()) : reply(502, ["error": err!, "url": p.engine.url?.absoluteString ?? ""])
+        err == nil ? ok(t.info()) : reply(502, ["error": err!, "url": t.url])
       }
     case "/nav", "/open":
       guard let url = input["url"] as? String else { return fail("url required") }
-      p.load(url) { err in
-        let e = err ?? p.refusedError
-        e == nil ? ok(p.info()) : reply(502, ["error": e!, "url": url])
+      t.load(url) { err in
+        let e = err ?? t.refusedError
+        e == nil ? ok(t.info()) : reply(502, ["error": e!, "url": url])
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-        if !p.engine.isLoading, let e = p.refusedError { p.finishWaiters(e) }
+        if !t.isLoading, let e = t.refusedError { t.finishWaiters(e) }
       }
-    case "/back": p.engine.goBack(); p.waitForLoad { _ in ok(p.info()) }
-    case "/forward": p.engine.goForward(); p.waitForLoad { _ in ok(p.info()) }
-    case "/reload": p.engine.reload(fromOrigin: false); p.waitForLoad { _ in ok(p.info()) }
-    case "/focus": focus(p); ok(p.info())
+    case "/back": t.engine.goBack(); t.waitForLoad { _ in ok(t.info()) }
+    case "/forward": t.engine.goForward(); t.waitForLoad { _ in ok(t.info()) }
+    case "/reload": t.engine.reload(fromOrigin: false); t.waitForLoad { _ in ok(t.info()) }
+    case "/focus":
+      p.select(t)
+      focus(p)
+      ok(t.info())
     case "/eval":
       let code = input["js"] as? String ?? ""
-      p.probingUntil = Date().addingTimeInterval(5)
-      js(p, JS.evaluate(code, asExpression: true), [:]) { v, e in
-        p.probingUntil = Date().addingTimeInterval(0.3)
+      t.probingUntil = Date().addingTimeInterval(5)
+      js(t, JS.evaluate(code, asExpression: true), [:]) { v, e in
+        t.probingUntil = Date().addingTimeInterval(0.3)
         guard let e else { return ok(["value": v ?? NSNull()]) }
         if !e.contains("SyntaxError") && !e.contains("Unexpected") { return fail(e) }
-        self.js(p, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
+        self.js(t, JS.evaluate(code, asExpression: false), [:]) { v, e in e == nil ? ok(["value": v ?? NSNull()]) : fail(e!) }
       }
     case "/console":
       let since = (input["since"] as? NSNumber)?.intValue ?? 0
@@ -1466,15 +2073,15 @@ final class App: NSObject, NSApplicationDelegate {
       if let bad = levels.first(where: { !Panel.consoleLevels.contains($0) }) {
         return fail("unknown level \(bad): use \(Panel.consoleLevels.sorted().joined(separator: ", "))")
       }
-      var messages = p.console.filter { ($0["seq"] as? Int ?? 0) > since && (levels.isEmpty || levels.contains($0["level"] as? String ?? "")) }
+      var messages = t.console.filter { ($0["seq"] as? Int ?? 0) > since && (levels.isEmpty || levels.contains($0["level"] as? String ?? "")) }
       if let limit = (input["limit"] as? NSNumber)?.intValue, limit > 0, messages.count > limit { messages = Array(messages.suffix(limit)) }
-      let result: [String: Any] = ["messages": messages, "last": p.consoleSeq, "dropped": p.consoleDropped]
-      if input["clear"] as? Bool == true { p.console = [] }
+      let result: [String: Any] = ["messages": messages, "last": t.consoleSeq, "dropped": t.consoleDropped]
+      if input["clear"] as? Bool == true { t.console = [] }
       ok(result)
     case "/snapshot":
       let args: [String: Any] = ["max": input["max"] ?? 400, "textMax": input["text_max"] ?? 6000]
       func attempt(_ left: Int) {
-        js(p, JS.snapshot, args) { v, e in
+        js(t, JS.snapshot, args) { v, e in
           if let e { return fail(e) }
           if v == nil || v is NSNull, left > 0 {
             return DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { attempt(left - 1) }
@@ -1485,32 +2092,32 @@ final class App: NSObject, NSApplicationDelegate {
       }
       attempt(10)
     case "/click":
-      js(p, JS.resolve, ["target": input["target"] as? String ?? ""]) { v, e in
+      js(t, JS.resolve, ["target": input["target"] as? String ?? ""]) { v, e in
         guard e == nil, let d = v as? [String: Any] else { return fail(e ?? "resolve failed") }
         if let err = d["error"] as? String { return fail(err) }
         let x = (d["x"] as? NSNumber)?.doubleValue ?? 0, y = (d["y"] as? NSNumber)?.doubleValue ?? 0
-        p.engine.click(x: x, y: y)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
+        t.engine.click(x: x, y: y)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { t.waitForLoad { _ in ok(t.info()) } }
       }
     case "/type":
-      js(p, JS.fill, ["target": input["target"] as? String ?? "", "text": input["text"] as? String ?? "",
+      js(t, JS.fill, ["target": input["target"] as? String ?? "", "text": input["text"] as? String ?? "",
                      "clear": input["clear"] as? Bool ?? false, "submit": input["submit"] as? Bool ?? false]) { v, e in
         guard e == nil else { return fail(e!) }
         if let d = v as? [String: Any], let err = d["error"] as? String { return fail(err) }
         if let d = v as? [String: Any], d["native"] as? Bool == true {
-          p.engine.focus()
-          p.engine.insertText(input["text"] as? String ?? "")
-          if input["submit"] as? Bool == true { _ = p.engine.press("enter") }
+          t.engine.focus()
+          t.engine.insertText(input["text"] as? String ?? "")
+          if input["submit"] as? Bool == true { _ = t.engine.press("enter") }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { p.waitForLoad { _ in ok(p.info()) } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { t.waitForLoad { _ in ok(t.info()) } }
       }
     case "/press":
       guard let k = input["key"] as? String else { return fail("key required") }
-      if p.engine.press(k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
+      if t.engine.press(k) { ok(["pressed": k]) } else { fail("unknown key \(k)") }
     case "/shot":
       let path = (input["path"] as? String) ?? NSTemporaryDirectory() + "rexweb-\(p.id.suffix(6))-\(Int(Date().timeIntervalSince1970)).png"
       guard path.lowercased().hasSuffix(".png") else { return fail("screenshot path must end in .png") }
-      p.engine.screenshot { png, err in
+      t.engine.screenshot { png, err in
         guard let png, let rep = NSBitmapImageRep(data: png) else { return fail(err ?? "snapshot failed") }
         do { try png.write(to: URL(fileURLWithPath: path)); ok(["path": path, "width": rep.pixelsWide, "height": rep.pixelsHigh]) }
         catch { fail(error.localizedDescription) }
@@ -1519,18 +2126,18 @@ final class App: NSObject, NSApplicationDelegate {
       let deadline = Date().addingTimeInterval((input["timeout"] as? NSNumber)?.doubleValue ?? 15)
       let args: [String: Any] = ["selector": input["selector"] as? String ?? "", "text": input["text"] as? String ?? ""]
       func poll() {
-        js(p, JS.exists, args) { v, _ in
-          if v as? Bool == true { return ok(p.info()) }
+        js(t, JS.exists, args) { v, _ in
+          if v as? Bool == true { return ok(t.info()) }
           if Date() > deadline { return reply(408, ["error": "timed out"]) }
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: poll)
         }
       }
-      p.waitForLoad { err in
-        if let err { return reply(502, ["error": err, "url": p.engine.url?.absoluteString ?? ""]) }
+      t.waitForLoad { err in
+        if let err { return reply(502, ["error": err, "url": t.url]) }
         poll()
       }
     default:
-      if Engine.route?(route, p, input, reply) == true { return }
+      if Engine.route?(route, t, input, reply) == true { return }
       reply(404, ["error": "unknown route \(route)"])
     }
   }

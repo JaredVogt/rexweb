@@ -9,10 +9,10 @@ enum Main {
     config.port = config.chromiumPort
     Engine.name = "chromium"
     Engine.label = "Chromium"
-    Engine.make = { panel in onMain { ChromiumEngine(panel: panel) } }
+    Engine.make = { tab in onMain { ChromiumEngine(tab: tab) } }
     Engine.setCookies = { cookies, done in onMain { ChromiumEngine.setCookies(cookies, done) } }
-    Engine.route = { route, panel, input, reply in
-      onMain { (panel.engine as? ChromiumEngine)?.route(route, input, reply) ?? false }
+    Engine.route = { route, tab, input, reply in
+      onMain { (tab.engine as? ChromiumEngine)?.route(route, input, reply) ?? false }
     }
 
     var configuration = CefRuntime.Configuration.embedded

@@ -18,7 +18,7 @@ func foundation(_ json: CefJSON) -> Any? {
 final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   static let networkLimit = 1000
 
-  weak var panel: Panel?
+  weak var tab: Tab?
   let page: CefPage
   let host: CefWindowedPageView
   var timer: Timer?
@@ -53,8 +53,8 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     set { page.zoomLevel = log(max(0.1, newValue)) / log(1.2) }
   }
 
-  init(panel: Panel) {
-    self.panel = panel
+  init(tab: Tab) {
+    self.tab = tab
     page = CefPage(url: URL(string: "about:blank")!)
     host = CefWindowedPageView(page: page)
     page.delegate = self
@@ -68,24 +68,24 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
 
   func poll() {
     let loading = page.isLoading
-    if loading && !wasLoading { loadFailed = false; awaiting = true; panel?.engineStarted() }
+    if loading && !wasLoading { loadFailed = false; awaiting = true; tab?.engineStarted() }
     // A load can start and end between two polls, so a requested load that
     // never shows as loading still ends once its grace period is over.
     if !loading && awaiting && queued == nil && (wasLoading || Date() > pendingLoadUntil) { finish() }
     // A load the page started itself can begin and end between two polls,
     // after a caller saw it loading and began to wait. Don't leave it waiting.
-    if !loading && !awaiting, let p = panel, !p.loadWaiters.isEmpty {
+    if !loading && !awaiting, let p = tab, !p.loadWaiters.isEmpty {
       if loadFailed { p.finishWaiters(p.lastError) } else { p.engineFinished() }
     }
     wasLoading = loading
     let now = "\(page.url?.absoluteString ?? "") \(page.title) \(page.canGoBack) \(page.canGoForward)"
-    if now != seen { seen = now; panel?.engineChanged() }
+    if now != seen { seen = now; tab?.engineChanged() }
   }
 
   func finish() {
     awaiting = false
     pendingLoadUntil = .distantPast
-    if !loadFailed { panel?.engineFinished() }
+    if !loadFailed { tab?.engineFinished() }
   }
 
   func page(_ page: CefPage, didFinishLoadWithStatus httpStatus: Int) {
@@ -98,7 +98,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     loadFailed = true
     awaiting = false
     pendingLoadUntil = .distantPast
-    panel?.engineFailed(error.message.isEmpty ? "error \(error.code)" : error.message, url: error.url?.absoluteString ?? "")
+    tab?.engineFailed(error.message.isEmpty ? "error \(error.code)" : error.message, url: error.url?.absoluteString ?? "")
   }
 
   /// Marks a load as under way before Chromium reports it, so a caller that
@@ -116,7 +116,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     switch request.disposition {
     case .newBackgroundTab:
       guard let url = request.targetURL else { return .deny }
-      panel?.openBeside(url.absoluteString)
+      tab?.openBeside(url.absoluteString)
       return .handled
     case .newPopup:
       return request.hasUserGesture ? .allowNativePopup : .default(for: request)
@@ -153,7 +153,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     on("Runtime.exceptionThrown") { [weak self] e in self?.exception(e["exceptionDetails"]) }
     on("Log.entryAdded") { [weak self] e in self?.logEntry(e["entry"]) }
     on("Page.frameNavigated") { [weak self] e in
-      if e["frame"]["parentId"].stringValue == nil { self?.panel?.engineCommitted(e["frame"]["url"].stringValue) }
+      if e["frame"]["parentId"].stringValue == nil { self?.tab?.engineCommitted(e["frame"]["url"].stringValue) }
     }
     on("Network.requestWillBeSent") { [weak self] e in self?.requestStarted(e) }
     on("Network.responseReceived") { [weak self] e in self?.responseReceived(e) }
@@ -209,7 +209,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     let level = ["warning": "warn", "error": "error", "assert": "error", "info": "info", "debug": "debug"][kind] ?? "log"
     let text = (e["args"].arrayValue ?? []).map(ChromiumEngine.text).joined(separator: " ")
     let top = e["stackTrace"]["callFrames"].arrayValue?.first
-    panel?.record(level: level, text: text, url: page.url?.absoluteString ?? "",
+    tab?.record(level: level, text: text, url: page.url?.absoluteString ?? "",
                   source: ChromiumEngine.place(top?["url"].stringValue, top?["lineNumber"].intValue, top?["columnNumber"].intValue))
   }
 
@@ -217,13 +217,13 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     let text = d["exception"]["description"].stringValue ?? d["text"].stringValue ?? "Uncaught error"
     let top = d["stackTrace"]["callFrames"].arrayValue?.first
     let where_ = ChromiumEngine.place(d["url"].stringValue ?? top?["url"].stringValue, d["lineNumber"].intValue, d["columnNumber"].intValue)
-    panel?.record(level: "error", text: text.hasPrefix("Uncaught") ? text : "Uncaught \(text)", url: page.url?.absoluteString ?? "", source: where_)
+    tab?.record(level: "error", text: text.hasPrefix("Uncaught") ? text : "Uncaught \(text)", url: page.url?.absoluteString ?? "", source: where_)
   }
 
   func logEntry(_ entry: CefJSON) {
     let level = ["warning": "warn", "error": "error", "info": "info", "verbose": "debug"][entry["level"].stringValue ?? ""] ?? "log"
     let from = entry["source"].stringValue ?? "browser"
-    panel?.record(level: level, text: "[\(from)] \(entry["text"].stringValue ?? "")", url: page.url?.absoluteString ?? "",
+    tab?.record(level: level, text: "[\(from)] \(entry["text"].stringValue ?? "")", url: page.url?.absoluteString ?? "",
                   source: ChromiumEngine.place(entry["url"].stringValue, entry["lineNumber"].intValue.map { $0 - 1 }, nil)
                     ?? entry["url"].stringValue)
   }
