@@ -5,6 +5,33 @@ WebKit browser, the engine that Safari uses. It sits beside your terminal.
 You and your agents can script it. An optional second app adds
 [Chromium panes](#chromium-panes).
 
+## This is a fork
+
+This is a fork of [acoyfellow/rexweb](https://github.com/acoyfellow/rexweb).
+Everything upstream does still works the same way. The fork adds:
+
+- **[Chromium panes](#chromium-panes).** A second, optional app draws panes
+  with Chromium through CEF. WebKit and Chromium panes run side by side, and
+  every command finds the right app by itself.
+- **[Tabs](#tabs).** A pane holds several pages, in both engines, with a tab
+  strip, shortcuts, and `rexweb tabs`, `rexweb tab` and `--tab` for scripts.
+  Clicked links and `target="_blank"` open tabs. Tabs come back after a
+  restart, and idle background tabs are unloaded to save memory.
+- **Console and HTML for scripts.** `rexweb console` reads a page's console
+  output and uncaught errors, and `rexweb html` reads its live HTML. Both work
+  in WebKit and Chromium panes.
+- **Chromium-only tools.** `rexweb network` lists a page's requests,
+  `rexweb devtools` opens DevTools, `rexweb cdp` sends any DevTools Protocol
+  command, and a [debugging port](#the-devtools-protocol-port) can be turned
+  on.
+- **Fixes.** Scripted clicks that were dropped when the app was not in front,
+  a pane drawn over the wrong Rex window, and a redraw storm that raised
+  Rex's idle CPU.
+
+This README is the full manual for the fork, so you do not need the upstream
+one. [docs/EXTENSIONS.md](docs/EXTENSIONS.md) explains how each addition works
+and why. The fork's work is on the `fork` branch; `main` mirrors upstream.
+
 <img src="docs/hero.png" alt="A Rex window with a shell on the left running rexweb commands, and a browser pane on the right showing a to-do app on localhost:3000 that the commands just added a task to.">
 
 ## Install
@@ -17,7 +44,7 @@ You need:
 - `jq`.
 
 ```sh
-git clone https://github.com/acoyfellow/rexweb
+git clone https://github.com/JaredVogt/rexweb
 cd rexweb && ./install.sh
 ```
 

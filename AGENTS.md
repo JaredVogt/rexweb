@@ -10,7 +10,7 @@ Requirements: macOS 14 or later, Rex with a working `rex` command, the Xcode
 command line tools (`xcode-select -p` succeeds), and `jq`.
 
 ```sh
-git clone https://github.com/acoyfellow/rexweb ~/src/rexweb
+git clone https://github.com/JaredVogt/rexweb ~/src/rexweb
 ~/src/rexweb/install.sh
 ```
 
