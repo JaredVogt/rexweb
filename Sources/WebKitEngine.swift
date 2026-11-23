@@ -90,11 +90,15 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     let zoom = web.pageZoom * web.magnification
     let pt = web.convert(NSPoint(x: x * zoom, y: y * zoom), to: nil)
     let t = ProcessInfo.processInfo.systemUptime
+    // The events go to this page itself, not through the window. The window
+    // drops a click while it isn't the key window, which is the usual case
+    // when an agent drives the pane, and gives it to whatever view is on show
+    // at that point, which for a background tab is another tab's page.
+    focus()
     for (type, dt) in [(NSEvent.EventType.leftMouseDown, 0.0), (.leftMouseUp, 0.03)] {
-      if let ev = NSEvent.mouseEvent(with: type, location: pt, modifierFlags: [], timestamp: t + dt,
-                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) {
-        window.sendEvent(ev)
-      }
+      guard let ev = NSEvent.mouseEvent(with: type, location: pt, modifierFlags: [], timestamp: t + dt,
+                                        windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else { continue }
+      if type == .leftMouseDown { web.mouseDown(with: ev) } else { web.mouseUp(with: ev) }
     }
   }
 
@@ -107,13 +111,13 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     ]
     guard let (code, chars) = keys[name.lowercased()] else { return false }
     guard let window = web.window else { return true }
-    if window.firstResponder == nil || window.firstResponder === window { window.makeFirstResponder(web) }
+    // Keys go to this page itself, not through the window, whose first
+    // responder may be the address field or another tab's page.
     let t = ProcessInfo.processInfo.systemUptime
     for type in [NSEvent.EventType.keyDown, .keyUp] {
-      if let ev = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: t, windowNumber: window.windowNumber,
-                                   context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
-        window.sendEvent(ev)
-      }
+      guard let ev = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: t, windowNumber: window.windowNumber,
+                                      context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) else { continue }
+      if type == .keyDown { web.keyDown(with: ev) } else { web.keyUp(with: ev) }
     }
     return true
   }
@@ -128,7 +132,12 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     }
   }
 
-  func focus() { web.window?.makeFirstResponder(web) }
+  /// Only the page on show takes the keyboard. A background tab's page as
+  /// first responder would swallow what the user types into the visible one.
+  func focus() {
+    if tab?.isActive == false { return }
+    web.window?.makeFirstResponder(web)
+  }
 
   func close() {
     popups.forEach { $0.window.close() }
@@ -155,9 +164,17 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
 
   func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-    let isPopup = windowFeatures.width != nil || windowFeatures.height != nil || navigationAction.navigationType == .other
+    // A window.open that asks for a size is a real popup, such as a sign-in
+    // window, and keeps its opener. So does one with no address yet, which
+    // the page fills in through the window it gets back. Anything else that
+    // wants a new window, such as a target="_blank" link or a plain
+    // window.open(url), becomes a tab, which has no opener. The tab comes to
+    // the front only if this one is on show.
+    let target = navigationAction.request.url
+    let blank = target == nil || target!.absoluteString.isEmpty || target!.scheme == "about"
+    let isPopup = windowFeatures.width != nil || windowFeatures.height != nil || blank
     if !isPopup {
-      if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
+      if let tab { tab.openTab(target!.absoluteString, foreground: tab.isActive) } else { webView.load(navigationAction.request) }
       return nil
     }
     guard let parent = web.window else { return nil }
@@ -171,7 +188,13 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
     if navigationAction.modifierFlags.contains(.command), let url = navigationAction.request.url,
        navigationAction.navigationType == .linkActivated {
-      tab?.openBeside(url.absoluteString)
+      // Cmd-click: a tab behind this one. With Shift, a tab in front. With Option, a pane beside.
+      let flags = navigationAction.modifierFlags
+      if flags.contains(.option) {
+        tab?.openBeside(url.absoluteString)
+      } else {
+        tab?.openTab(url.absoluteString, foreground: flags.contains(.shift))
+      }
       decisionHandler(.cancel)
       return
     }
