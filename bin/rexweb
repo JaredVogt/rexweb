@@ -25,6 +25,10 @@ Panes:
   focus       Give a browser pane the keyboard
   close       Close a browser pane
 
+Tabs:
+  tabs        List a pane's tabs
+  tab         Open, select, or close a tab in a pane
+
 Browse:
   nav         Go to a URL and wait for it to load
   back        Go back
@@ -62,9 +66,15 @@ Every command that acts on a pane takes -b BLOCK, a pane's ID, ID suffix, or
 title. Without it, rexweb uses the browser pane you used most recently. Scripts
 and agents should pass the ID that "rexweb open" prints.
 
+A pane can hold several tabs. Every command that acts on a page takes -t TAB, a
+tab's ID such as t2 or its position counted from 1. Without it, rexweb uses the
+pane's active tab.
+
 Run "rexweb [command] --help" for more information about a command.
 EOF
 }
+
+tab_opt="  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)"
 
 help_cmd() {
   case "$1" in
@@ -100,7 +110,7 @@ Options:
       --ratio PCT        give the new pane PCT percent of the split (default 50)
   -b, --block BLOCK      split beside BLOCK (defaults to REX_BLOCK, then the focused pane)
   -s, --session SESSION  open in SESSION (defaults to REX_SESSION)
-      --tab              open the pane in a new tab instead of a split
+      --tab              open the pane in a new Rex tab instead of a split
       --engine ENGINE    draw the page with ENGINE (webkit or chromium) (default the "engine" key in ~/.rexweb/config.json, else webkit)
       --focus=BOOL       focus the new pane (default true)
       --no-wait          print the ID without waiting for the page to load
@@ -140,22 +150,83 @@ Options:
       --json  output panes as JSON
 EOF
     ;;
-    focus|close|back|forward|reload|info) cat <<EOF
-$(case "$1" in
-  focus) echo "Give a browser pane the keyboard, and show it if its tab isn't active." ;;
-  close) echo "Close a browser pane and the Rex pane that holds it." ;;
-  back) echo "Go back in a browser pane's history and wait for the page to load." ;;
-  forward) echo "Go forward in a browser pane's history and wait for the page to load." ;;
-  reload) echo "Reload a browser pane's page and wait for it to load." ;;
-  info) echo "Print a browser pane's URL, title, and whether it's loading." ;;
-esac)
+    focus|close|back|forward|reload|info)
+      case "$1" in
+        focus) echo "Give a browser pane the keyboard, and show it if its Rex tab isn't active. With -t, also show that tab of the pane." ;;
+        close) echo "Close a browser pane, with every tab in it, and the Rex pane that holds it. To close one tab, use \"rexweb tab close\"." ;;
+        back) echo "Go back in a browser pane's history and wait for the page to load." ;;
+        forward) echo "Go forward in a browser pane's history and wait for the page to load." ;;
+        reload) echo "Reload a browser pane's page and wait for it to load." ;;
+        info) echo "Print a browser pane's URL, title, and whether it's loading." ;;
+      esac
+      cat <<EOF
 
 Usage:
   rexweb $1 [flags]
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
-      --json         output the result as JSON
+EOF
+      [ "$1" = close ] || echo "$tab_opt"
+      echo "      --json         output the result as JSON"
+    ;;
+    tabs) cat <<'EOF'
+List a browser pane's tabs, in the order the tab strip shows them.
+
+Each line has the tab's position, its ID, ● for the active tab or ○ for the
+others, its title, and its URL. A tab that was unloaded to save memory ends
+with [asleep]; it reloads when a command uses it. A pane shows its tab strip
+only when it has two or more tabs.
+
+Examples:
+  rexweb tabs
+  rexweb tabs --json | jq -r .active
+
+Usage:
+  rexweb tabs [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --json         output {id, active, tabs} as JSON; each tab has id, index, url, title, active, asleep, loading
+EOF
+    ;;
+    tab) cat <<'EOF'
+Open, select, or close a tab in a browser pane.
+
+TAB is a tab's ID, such as t2, or its position counted from 1. IDs stay the
+same while the pane lives; positions change as tabs open and close. "rexweb
+tabs" lists both.
+
+"tab new" opens a tab after the pane's last tab and shows it. It prints the new
+tab's ID, then waits for the page to load. If the page doesn't load, it still
+prints the ID, writes the error to stderr, and exits 1. URL takes the same
+forms as "rexweb open". Without URL, the tab opens empty.
+
+"tab select" shows a tab. "tab close" closes a tab and prints its ID; without
+TAB it closes the active tab. Closing a pane's last tab closes the pane.
+
+Commands:
+  new [URL]     Open a tab
+  select TAB    Show a tab
+  close [TAB]   Close a tab
+  ls            List the pane's tabs, as "rexweb tabs" does
+
+Examples:
+  rexweb tab new https://example.com
+  t=$(rexweb tab new --background localhost:8080); rexweb eval -t "$t" document.title
+  rexweb tab select 1
+  rexweb tab close t2
+
+Usage:
+  rexweb tab new [URL] [flags]
+  rexweb tab select TAB [flags]
+  rexweb tab close [TAB] [flags]
+
+Options:
+  -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+      --background   new: open the tab without showing it
+      --no-wait      new: print the ID without waiting for the page to load
+      --json         output the result as JSON: the tab's info for new and select, {id, closed, tabs, active, pane_closed} for close
 EOF
     ;;
     nav) cat <<'EOF'
@@ -170,6 +241,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --json         output the result as JSON
 EOF
     ;;
@@ -188,6 +260,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --json         output the snapshot as JSON
 EOF
     ;;
@@ -205,6 +278,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     type) cat <<'EOF'
@@ -222,6 +296,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --clear        replace the element's text instead of adding to it
       --submit       submit the element's form afterward
 EOF
@@ -237,6 +312,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     eval) cat <<'EOF'
@@ -255,6 +331,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     wait) cat <<'EOF'
@@ -269,6 +346,7 @@ Usage:
 
 Options:
   -b, --block BLOCK       act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB           act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --selector SELECTOR wait until SELECTOR matches an element
       --text TEXT         wait until the page's text contains TEXT
       --timeout SECONDS   give up after SECONDS (default 15)
@@ -285,6 +363,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     console) cat <<'EOF'
@@ -309,6 +388,7 @@ Usage:
 
 Options:
   -b, --block BLOCK   act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB       act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --level LEVELS  print only LEVELS, a comma-separated list of log, info, warn, error, debug, navigation
       --since N       print only messages numbered above N
       --limit N       print only the newest N messages
@@ -345,6 +425,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
       --since N      print only requests numbered above N
       --limit N      print only the newest N requests
       --failed       print only requests that failed or got a status of 400 or above
@@ -370,6 +451,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     devtools) cat <<'EOF'
@@ -388,6 +470,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     html) cat <<'EOF'
@@ -402,6 +485,7 @@ Usage:
 
 Options:
   -b, --block BLOCK  act on BLOCK (defaults to the most recently used browser pane)
+  -t, --tab TAB      act on TAB, a tab ID such as t2 or a position counted from 1 (defaults to the pane's active tab)
 EOF
     ;;
     cookies) cat <<'EOF'
@@ -541,6 +625,8 @@ ensure_app() {
 api() {
   local path="$1" body="${2:-{\}}" timeout="${3:-30}" out code
   case "$path" in /list|/health|/cookies|/cookies/import|/links|/default-browser) ;; *) route ;; esac
+  # Every page command names its tab the same way. No tab means the pane's active one.
+  [ -z "$tabsel" ] || body="$(jq -c --arg t "$tabsel" '.tab = $t' <<<"$body")"
   out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
     -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" ||
     die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
@@ -566,14 +652,18 @@ pane_bin() {
   die "rexweb-pane not found. Reinstall rexweb."
 }
 
-# Parse the shared flags: -b BLOCK, --json, -h. Everything else lands in $rest.
-block="" json=0 rest=()
+# Parse the shared flags: -b BLOCK, -t TAB, --json, -h. Everything else lands in $rest.
+block="" tabsel="" json=0 rest=()
 parse() {
   rest=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -b|--block) [ $# -ge 2 ] || die "flag needs an argument: $1"; block="$2"; shift 2 ;;
       --block=*) block="${1#*=}"; shift ;;
+      -t|--tab) [ $# -ge 2 ] || die "flag needs an argument: $1"; tabsel="$2"; shift 2
+        [ -n "$tabsel" ] || die "--tab needs a tab ID such as t2, or a position counted from 1" ;;
+      --tab=*) tabsel="${1#*=}"; shift
+        [ -n "$tabsel" ] || die "--tab needs a tab ID such as t2, or a position counted from 1" ;;
       --json) json=1; shift ;;
       -h|--help) help_cmd "$cmd"; exit 0 ;;
       *) rest+=("$1"); shift ;;
@@ -585,9 +675,20 @@ target() { jq -nc --arg id "$block" '{id:$id}'; }
 
 need() { [ "$1" -ge 2 ] || die "flag needs an argument: $2"; }
 
-pane_line() { jq -r '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .engine == "chromium" then "  [chromium]" else "" end)'; }
+# For commands that act on a whole pane, or on no pane.
+no_tab() { [ -z "$tabsel" ] || die "$cmd doesn't take --tab${1:+. $1}"; }
+
+# One line for a pane. In a pane with more than one tab, "ls" adds the tab
+# count, and a command that acted on one tab adds which tab that was.
+pane_line() { jq -r --arg mode "${1:-tab}" '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .engine == "chromium" then "  [chromium]" else "" end)
+  + (if (.tabs // 1) < 2 then "" elif $mode == "count" then "  [\(.tabs) tabs]" else "  [tab \(.tab), \(.tab_index) of \(.tabs)]" end)'; }
 
 print_info() { if [ "$json" = 1 ]; then jq .; else pane_line; fi; }
+
+print_tabs() {
+  if [ "$json" = 1 ]; then jq . <<<"$1"
+  else jq -r '.tabs[] | "\(.index)  \(.id)  \(if .active then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .asleep then "  [asleep]" else "" end)' <<<"$1"; fi
+}
 
 # ---------------------------------------------------------------- commands
 
@@ -608,7 +709,7 @@ case "$cmd" in
     ;;
 
   doctor)
-    parse "$@"
+    parse "$@"; no_tab
     checks=() failed=0
     check() {
       local ok="$1" name="$2" detail="$3"
@@ -736,7 +837,7 @@ case "$cmd" in
     ;;
 
   ls|list)
-    parse "$@"
+    parse "$@"; no_tab "Use \"rexweb tabs\" to list a pane's tabs."
     out='{"panels":[]}' up=0
     for p in "$wport" "$cport"; do
       [ -z "${REXWEB_PORT:-}" ] || [ "$p" = "$port" ] || continue
@@ -747,7 +848,7 @@ case "$cmd" in
       out="$(jq -c -s '{panels: (.[0].panels + .[1].panels | sort_by(-(.active // 0)))}' <<<"$out$one")"
     done
     [ "$up" = 1 ] || die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
-    if [ "$json" = 1 ]; then jq . <<<"$out"; else jq -c '.panels[]' <<<"$out" | while read -r p; do pane_line <<<"$p"; done; fi
+    if [ "$json" = 1 ]; then jq . <<<"$out"; else jq -c '.panels[]' <<<"$out" | while read -r p; do pane_line count <<<"$p"; done; fi
     ;;
 
   info|focus|back|forward|reload)
@@ -756,10 +857,69 @@ case "$cmd" in
     ;;
 
   close)
-    parse "$@"
+    parse "$@"; no_tab "It closes the whole pane. Use \"rexweb tab close TAB\" to close one tab."
+    [ ${#rest[@]} -eq 0 ] || die "unknown argument: ${rest[0]}. Name the pane with -b BLOCK."
     id="$(api /info "$(target)" | jq -r .id)"
     rex block close "$id" >/dev/null 2>&1 || api /close "$(jq -nc --arg id "$id" '{id:$id}')" >/dev/null
     [ "$json" = 1 ] && jq -nc --arg id "$id" '{closed:$id}' || echo "$id"
+    ;;
+
+  tabs)
+    parse "$@"; no_tab "Use \"rexweb tab select TAB\" to show a tab."
+    [ ${#rest[@]} -eq 0 ] || die "unknown argument: ${rest[0]}"
+    print_tabs "$(api /tabs "$(target)")"
+    ;;
+
+  tab)
+    parse "$@"
+    sub="${rest[0]:-}"
+    background=false wait=1 words=()
+    for a in ${rest[@]+"${rest[@]:1}"}; do
+      case "$a" in
+        --background|--bg) background=true ;;
+        --no-wait) wait=0 ;;
+        -*) die "unknown flag: $a" ;;
+        *) words+=("$a") ;;
+      esac
+    done
+    [ ${#words[@]} -le 1 ] || die "unknown argument: ${words[1]}"
+    case "$sub" in
+      new)
+        cmd="tab new"; no_tab "The new tab goes after the pane's last tab."
+        url="${words[0]:-}"
+        route  # here, not in the subshell below, so the wait asks the same app
+        info="$(api /tab/new "$(jq -nc --arg id "$block" --arg u "$url" --argjson bg "$background" '{id:$id, url:$u, background:$bg}')")"
+        id="$(jq -r .id <<<"$info")" tabsel="$(jq -r .tab <<<"$info")"
+        err=""
+        if [ "$wait" = 1 ] && [ -n "$url" ]; then
+          out="$(curl -s -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" -H "x-rexweb-token: $(token)" \
+            -d "$(jq -nc --arg id "$id" --arg t "$tabsel" '{id:$id, tab:$t, timeout:30}')")" || out=$'{}\n000'
+          code="${out##*$'\n'}"; out="${out%$'\n'*}"
+          if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null)"; fi
+          now="$(raw /info "$(jq -nc --arg id "$id" --arg t "$tabsel" '{id:$id, tab:$t}')" 2>/dev/null)" &&
+            jq -e --arg t "$tabsel" '.tab == $t' >/dev/null 2>&1 <<<"$now" && info="$now"
+        fi
+        if [ "$json" = 1 ]; then jq . <<<"$info"; else echo "$tabsel"; fi
+        [ -z "$err" ] || die "the page didn't load: $err"
+        ;;
+      select|sel)
+        [ ${#words[@]} -eq 0 ] || tabsel="${words[0]}"
+        [ -n "$tabsel" ] || die "tab select needs a TAB. Run \"rexweb tab --help\"."
+        api /tab/select "$(target)" | print_info
+        ;;
+      close)
+        [ ${#words[@]} -eq 0 ] || tabsel="${words[0]}"
+        out="$(api /tab/close "$(target)")"
+        if [ "$json" = 1 ]; then jq . <<<"$out"; else jq -r .closed <<<"$out"; fi
+        ;;
+      ls|list)
+        cmd="tab ls"; no_tab "Use \"rexweb tab select TAB\" to show a tab."
+        [ ${#words[@]} -eq 0 ] || die "unknown argument: ${words[0]}"
+        print_tabs "$(api /tabs "$(target)")"
+        ;;
+      "") help_cmd tab ;;
+      *) die "unknown tab command \"$sub\". Run \"rexweb tab --help\"." ;;
+    esac
     ;;
 
   nav|go)
