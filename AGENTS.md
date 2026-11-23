@@ -334,9 +334,12 @@ tabs you are working in. Sleeping tabs get the cookies when they wake.
    too, with their IDs, and with every tab except the showing one asleep.
 3. Read what the pane itself says: `rex capture -b "$id"`. It prints the URL,
    or why it can't reach RexWeb.
-4. If the Rex server restarted, old browser panes are now plain shells.
+4. Read the app's log: `tail ~/.rexweb/rexweb.log`, or
+   `~/.rexweb/rexweb-chromium.log` for Chromium panes. It has a line with
+   the time for each pane that registered or closed, and why it closed.
+5. If the Rex server restarted, old browser panes are now plain shells.
    Close them and open new ones.
-5. Reinstall: `~/src/rexweb/install.sh`.
+6. Reinstall: `~/src/rexweb/install.sh`.
 
 ## How it talks
 

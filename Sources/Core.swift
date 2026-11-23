@@ -175,6 +175,51 @@ func orNull(_ v: Any?) -> Any { v ?? NSNull() }
 
 func log(_ s: String) {
   FileHandle.standardError.write(("[rexweb] " + s + "\n").data(using: .utf8)!)
+  LogFile.write(s)
+}
+
+/// A debugging log on disk: `~/.rexweb/rexweb.log`, or `rexweb-chromium.log`
+/// for the Chromium app. The app is started with `open`, so nothing reads
+/// its standard error. Lines hold page addresses, so the file is made
+/// readable by its owner only. Past 1 MB it becomes `.log.1`, replacing the
+/// one before, and a new file starts.
+enum LogFile {
+  static let maxBytes: UInt64 = 1 << 20
+  private static let queue = DispatchQueue(label: "rexweb.log")
+  private static var handle: FileHandle?
+  private static var size: UInt64 = 0
+  private static let stamp: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
+    return f
+  }()
+  static var path: String {
+    NSHomeDirectory() + "/.rexweb/" + (Engine.name == "chromium" ? "rexweb-chromium.log" : "rexweb.log")
+  }
+
+  static func write(_ s: String) {
+    let now = Date()
+    queue.async {
+      guard let data = "\(stamp.string(from: now))  \(s)\n".data(using: .utf8) else { return }
+      if size + UInt64(data.count) > maxBytes, handle != nil {
+        try? handle?.close()
+        handle = nil
+        _ = try? FileManager.default.removeItem(atPath: path + ".1")
+        _ = try? FileManager.default.moveItem(atPath: path, toPath: path + ".1")
+      }
+      if handle == nil {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: path) {
+          guard fm.createFile(atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]) else { return }
+        }
+        guard let h = FileHandle(forWritingAtPath: path) else { return }
+        size = (try? h.seekToEnd()) ?? 0
+        handle = h
+      }
+      if (try? handle?.write(contentsOf: data)) != nil { size += UInt64(data.count) }
+    }
+  }
 }
 
 enum Rex {
@@ -1256,6 +1301,7 @@ final class Tracker {
     guard let v = views[session] else { return }
     let ids = Set(Tracker.allBlockIDs(v))
     for p in App.shared.panels.values where p.session == session && !ids.contains(p.id) {
+      log("pane \(p.id.suffix(6)) closed: Rex no longer has its block")
       App.shared.closePanel(p.id)
     }
   }
@@ -2066,7 +2112,7 @@ final class App: NSObject, NSApplicationDelegate {
       tracker.refresh(session)
       let url = p.restored ? p.activeTab.url : (input["url"] as? String ?? "")
       if !p.restored, !url.isEmpty { p.load(url) }
-      log("pane \(id.suffix(6)) registered\(p.restored ? " with \(p.tabs.count) saved tab(s)" : "")")
+      log("pane \(id.suffix(6)) registered in session \(session.suffix(6)), \(p.restored ? "with \(p.tabs.count) saved tab(s)" : "url \(url.isEmpty ? "(none)" : String(url.prefix(200)))")")
       if input["focus"] as? Bool == true {
         p.focusURLWhenShown = url.isEmpty
         self.focus(p)
@@ -2074,6 +2120,7 @@ final class App: NSObject, NSApplicationDelegate {
       return ok(p.info())
     case "/close":
       guard let id = input["id"] as? String else { return fail("id required") }
+      if panels[id] != nil { log("pane \(id.suffix(6)) closed by its pane script or the CLI") }
       closePanel(id)
       forgetTabs(id)
       return ok(["closed": id])
