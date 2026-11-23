@@ -23,8 +23,12 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   let host: CefWindowedPageView
   var timer: Timer?
   var tasks: [Task<Void, Never>] = []
+  /// The last batch of input events sent. See `sendInOrder`.
+  var inputTail: Task<Void, Never>?
 
   var wasLoading = false
+  /// Whether the tab's view was on show when focus emulation was last set.
+  var wasShown: Bool?
   /// A load was asked for or seen, and its end hasn't been reported yet.
   var awaiting = false
   var pendingLoadUntil = Date.distantPast
@@ -78,6 +82,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
       if loadFailed { p.finishWaiters(p.lastError) } else { p.engineFinished() }
     }
     wasLoading = loading
+    if ready, wasShown != !host.isHidden { emulateFocus() }
     let now = "\(page.url?.absoluteString ?? "") \(page.title) \(page.canGoBack) \(page.canGoForward)"
     if now != seen { seen = now; tab?.engineChanged() }
   }
@@ -90,7 +95,9 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
 
   func page(_ page: CefPage, didFinishLoadWithStatus httpStatus: Int) {
     emulateFocus()
-    if awaiting && !page.isLoading { finish() }
+    // The blank page an engine starts on can finish while the first real
+    // load still waits in `queued`. That must not end the wait for it.
+    if awaiting && queued == nil && !page.isLoading { finish() }
   }
 
   func page(_ page: CefPage, didFailLoad error: CefLoadError) {
@@ -109,22 +116,25 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     pendingLoadUntil = Date().addingTimeInterval(1.5)
   }
 
-  /// Cmd-click opens a pane beside this one, a sized popup (such as a
-  /// sign-in window) opens natively so it keeps its opener, and any other
-  /// new-window request loads in this pane, as WebKit panes do.
+  /// Cmd-click opens a background tab; Shift-Cmd-click, Shift-click,
+  /// `target="_blank"` and an unsized `window.open` open a tab in front, or
+  /// behind when the page asking is itself in a background tab; and
+  /// Cmd-Option-click, which Chromium reports as a split view, opens a pane
+  /// beside this one. A sized popup (such as a sign-in window) opens
+  /// natively so it keeps its opener. A tab or pane opened here is a separate
+  /// page: the opener gets no window handle and the new page no `opener`.
   func page(_ page: CefPage, decideWindowOpenFor request: CefWindowOpenRequest) -> CefWindowOpenDecision {
-    switch request.disposition {
-    case .newBackgroundTab:
-      guard let url = request.targetURL else { return .deny }
-      tab?.openBeside(url.absoluteString)
-      return .handled
-    case .newPopup:
+    if request.disposition == .newPopup {
       return request.hasUserGesture ? .allowNativePopup : .default(for: request)
-    case .newForegroundTab, .newWindow:
-      return request.hasUserGesture && request.targetURL != nil ? .openInCurrentPage : .default(for: request)
-    default:
-      return .default(for: request)
     }
+    guard request.hasUserGesture, let url = request.targetURL?.absoluteString, let tab else { return .default(for: request) }
+    switch request.disposition {
+    case .newBackgroundTab: tab.openTab(url, foreground: false)
+    case .newForegroundTab, .newWindow: tab.openTab(url, foreground: tab.isActive)
+    case .newSplitView: tab.openBeside(url)
+    default: return .default(for: request)
+    }
+    return .handled
   }
 
   func load(_ url: URL) {
@@ -138,8 +148,15 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   // MARK: DevTools Protocol
 
   func send(_ method: String, _ params: CefJSON = [:], _ done: ((CefJSON?, String?) -> Void)? = nil) {
+    // Await the reply before the optional call: `done?(try await …)` would
+    // skip the send itself whenever there is no `done`.
     Task { @MainActor in
-      do { done?(try await page.devTools.send(method, params), nil) } catch { done?(nil, "\(error)") }
+      do {
+        let reply = try await page.devTools.send(method, params)
+        done?(reply, nil)
+      } catch {
+        if let done { done(nil, "\(error)") } else { log("\(method) failed: \(error)") }
+      }
     }
   }
 
@@ -178,10 +195,16 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
         do { _ = try await self.page.devTools.send("\(domain).enable") }
         catch { log("\(domain).enable failed: \(error)") }
       }
+      self.tellHidden()
       self.emulateFocus()
+      // Let the blank page the engine starts on end first, so that its end
+      // can't be taken for the end of the load asked for.
+      for _ in 0..<100 where self.page.isLoading { try? await Task.sleep(nanoseconds: 20_000_000) }
+      if Task.isCancelled { return }
       self.ready = true
       if let url = self.queued {
         self.queued = nil
+        self.wasLoading = false
         self.expectLoad()
         _ = self.page.load(url)
       }
@@ -318,12 +341,15 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     return true
   }
 
-  func insertText(_ text: String) { send("Input.insertText", ["text": .string(text)]) }
+  func insertText(_ text: String) { sendInOrder([("Input.insertText", ["text": .string(text)])]) }
 
-  /// Sends input events one after another. Chromium drops a press and its release when they arrive
-  /// out of order, which separate `send` tasks do not rule out.
+  /// Sends input events one after another, and after any sent before them. Chromium drops a press
+  /// and its release when they arrive out of order, which separate `send` tasks do not rule out,
+  /// and text typed before a key must reach the page before the key does.
   func sendInOrder(_ steps: [(String, CefJSON)]) {
-    Task { @MainActor [weak self] in
+    let earlier = inputTail
+    inputTail = Task { @MainActor [weak self] in
+      await earlier?.value
       for (method, params) in steps {
         guard let self else { return }
         do { _ = try await self.page.devTools.send(method, params) } catch { log("\(method) failed: \(error)"); return }
@@ -331,9 +357,26 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     }
   }
 
-  /// Chromium drops scripted clicks and keys while the page is unfocused, and a pane driven from the
-  /// CLI rarely has the keyboard. Focus emulation makes the page act focused without taking it.
-  func emulateFocus() { send("Emulation.setFocusEmulationEnabled", ["enabled": true]) }
+  /// A pane driven from the CLI rarely has the keyboard. Focus emulation makes the page on show
+  /// act focused without taking it: `document.hasFocus()` is true and the page counts as visible.
+  /// It is off for a background tab, because it would also keep that page drawing frames at full
+  /// rate while nobody can see it. Scripted input reaches a background tab without it.
+  func emulateFocus() {
+    wasShown = !host.isHidden
+    send("Emulation.setFocusEmulationEnabled", ["enabled": .bool(!host.isHidden)])
+  }
+
+  /// A tab that starts in the background is put in the pane already hidden, which Chromium never
+  /// hears about: it goes on treating the page as visible. Showing and hiding the page's view in
+  /// one go, before anything can draw, tells it.
+  func tellHidden() {
+    guard host.isHidden else { return }
+    let native = page.nativeView, nativeWasHidden = native?.isHidden ?? false
+    host.isHidden = false
+    if nativeWasHidden { native?.isHidden = false }
+    if nativeWasHidden { native?.isHidden = true }
+    host.isHidden = true
+  }
 
   func screenshot(_ done: @escaping (Data?, String?) -> Void) {
     send("Page.captureScreenshot", ["format": "png"]) { reply, err in
@@ -342,7 +385,9 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
     }
   }
 
-  func focus() { host.window?.makeFirstResponder(host) }
+  /// A background tab's view is hidden. Making it first responder would take
+  /// the keyboard from the tab on show, and scripted input doesn't need it.
+  func focus() { if !host.isHidden { host.window?.makeFirstResponder(host) } }
 
   func close() {
     timer?.invalidate()
