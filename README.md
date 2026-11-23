@@ -44,7 +44,7 @@ git pull && ./install.sh
 ```
 
 Reinstalling restarts RexWeb. Open panes go blank for about 2 seconds. Then
-they come back.
+they come back, with their [tabs](#tabs).
 
 If you installed the Chromium engine, update both apps with
 `git pull && ./install.sh --with-chromium`. Plain `./install.sh` rebuilds only
@@ -73,6 +73,9 @@ rexweb open docs.rs --split=below
 rexweb open --tab github.com
 ```
 
+`open --tab` puts the pane in a new Rex tab. Tabs inside a browser pane are a
+different thing. See [Tabs](#tabs).
+
 Browser panes show only while their Rex window is open on screen. A browser
 pane behaves like any other Rex pane. You can split it, resize it,
 zoom it, move it to another tab, or close it. Its header shows the page title.
@@ -89,14 +92,71 @@ pane. Use `--no-wait` to skip the wait.
 | `Shift-Cmd-R` | Reload without cache |
 | `Cmd-[` / `Cmd-]` | Back / forward |
 | `Cmd-+` / `Cmd--` / `Cmd-0` | Zoom |
-| `Cmd-W` | Close the pane |
+| `Cmd-T` | New tab |
+| `Cmd-W` | Close the tab. On the last tab, close the pane |
+| `Ctrl-Tab` / `Ctrl-Shift-Tab` | Next tab / previous tab |
 | `Shift-Cmd-B` | Open another browser pane beside it |
-| `Cmd`-click a link | Open it in a new pane |
+| `Cmd`-click a link | Open it in a new tab, behind this one |
+| `Shift-Cmd`-click a link | Open it in a new tab, in front |
+| `Cmd-Opt`-click a link | Open it in a new pane beside this one |
 | `Ctrl-Opt-Arrow` | Move to the Rex pane in that direction |
 | `` Ctrl-Opt-` `` | Back to Rex |
 
 Right-click and choose **Inspect Element** for Web Inspector. In a Chromium
 pane, run `rexweb devtools` instead.
+
+### Tabs
+
+A browser pane holds one or more tabs. Each tab is its own page. A pane with
+one tab looks the same as before. With two or more tabs, a strip of tabs
+shows above the address bar. Click a tab to show it. Each tab has a close
+button, and the `+` button at the end of the strip opens a new tab.
+
+Links open tabs in the same pane:
+
+- `Cmd`-click opens the link in a background tab, right after the current
+  tab. `Shift-Cmd`-click opens it in front.
+- A link with `target="_blank"`, and a `window.open` that asks for no size,
+  open a tab in front.
+- A `window.open` that asks for a size stays a separate popup window.
+  Sign-in popups are of this kind. In a WebKit pane, so is a `window.open`
+  with no address, which the page fills in afterward.
+- `Cmd-Opt`-click opens the link in a new pane beside this one.
+
+The tab shortcuts work only while a browser pane has the keyboard. `Cmd-1` to
+`Cmd-9`, `Shift-Cmd-[`, and `Shift-Cmd-]` still go to Rex and switch Rex's
+own tabs.
+
+From a shell:
+
+```sh
+rexweb tabs                          # list the pane's tabs
+rexweb tab new example.com           # open a tab in front
+rexweb tab new --background docs.rs  # open a tab behind the current one
+rexweb tab select t2                 # show a tab
+rexweb tab close t2                  # close a tab; no value closes the current tab
+```
+
+`rexweb tabs` prints one line for each tab: its position, its ID, a mark for
+the tab that is showing, its title, and its URL. A sleeping tab ends with
+`[asleep]`.
+
+`tab new` prints the ID of the new tab: `t1`, `t2`, and so on. Then it waits
+for the page to load, as `open` does. Use `--no-wait` to skip the wait. Where
+a command takes a tab, it accepts the ID or the tab's position, counted
+from 1. IDs start again from `t1` when RexWeb restarts. `rexweb ls` adds
+`[3 tabs]` to a pane that has more than one. Closing a pane's last tab closes
+the pane. `rexweb close` closes the whole pane, with every tab in it.
+
+**Tabs come back.** When RexWeb restarts, each pane gets its tabs back. Only
+the tab that was showing loads. The others stay asleep until you select them.
+Blank tabs do not come back. Closing a pane forgets its tabs.
+
+**Idle tabs sleep.** A background tab that nobody has used for 30 minutes is
+unloaded to give its memory back. Its tab stays in the strip, dimmed, and the
+page loads again when you select it. A tab that slept loses its back and
+forward history. Set `tab_unload_minutes` to change the time, or to 0 to turn
+this off. See [Configure](#configure).
 
 ### Open Rex's links in Rex
 
@@ -150,6 +210,7 @@ $ rexweb eval -b "$id" 'document.querySelector("#meta").textContent'
 | `network` | Chromium panes only. Print the page's requests; `--failed`, `--since N`, `--clear` |
 | `devtools [close]` | Chromium panes only. Open or close Chromium DevTools |
 | `cdp METHOD [PARAMS]` | Chromium panes only. Send one Chrome DevTools Protocol command and print the result |
+| `tabs`, `tab new`, `tab select`, `tab close` | List, open, show, and close [tabs](#tabs) |
 | `back`, `forward`, `reload`, `info`, `ls`, `focus`, `close` | |
 
 Scripts and agents must keep the ID from `open` and pass it with `-b ID`.
@@ -159,6 +220,20 @@ commands take `--json`. `rexweb COMMAND --help` shows the rest.
 
 `click`, `type`, and `press` need the pane on screen. If it isn't, they fail
 after about a second. `snapshot`, `eval`, and `screenshot` work either way.
+
+Every page command takes `--tab TAB`, or `-t TAB`, to act on one tab of the
+pane. Without it, a command acts on the tab that is showing, so scripts
+written before tabs work unchanged.
+
+```sh
+rexweb eval -b "$id" --tab t2 'document.title'
+```
+
+A command on a background tab does not change the tab that you see. There is
+one exception. In a WebKit pane, `screenshot` shows the tab for a moment,
+takes the picture, and switches back. In a Chromium pane, no command shows
+the tab. A command for a sleeping tab wakes the tab and waits for its page to
+load.
 
 [AGENTS.md](AGENTS.md) is the guide for coding agents. `rexweb skill` prints
 the same guide.
@@ -203,16 +278,17 @@ rexweb devtools -b "$id"
 ```
 
 Only `open` needs `--engine`. Every other command finds the app that owns the
-pane. `rexweb ls` marks Chromium panes with `[chromium]`. `Cmd`-click on a
-link opens a pane with the same engine. To make Chromium the default, set
-`"engine": "chromium"` in `~/.rexweb/config.json`.
+pane. `rexweb ls` marks Chromium panes with `[chromium]`. A link that opens
+a new tab or a new pane keeps the same engine. To make Chromium the default,
+set `"engine": "chromium"` in `~/.rexweb/config.json`.
 
 `rexweb console` prints more for a Chromium pane. The browser's own messages
 start with their origin in brackets, such as `[network]` or `[security]`.
 
 `rexweb network` prints each request's number, status, method, type, and URL.
-A failed request shows `ERR` and the reason. Each pane keeps its last 1000
-requests. Headers and bodies are not kept. `network`, `devtools`, and `cdp`
+A failed request shows `ERR` and the reason. Each tab keeps its last 1000
+requests. Headers and bodies are not kept. A tab that sleeps loses its
+network log. `network`, `devtools`, and `cdp`
 fail with a clear error on a WebKit pane.
 
 `rexweb cdp` sends one Chrome DevTools Protocol command to the pane and prints
@@ -256,6 +332,8 @@ panes that are signed in to your accounts.
   Any process that runs as you can read them. The profile is in
   `~/.rexweb/chromium`.
 - Passkeys and security keys do not work, as in WebKit panes.
+- A screenshot has one pixel for each CSS pixel of the tab, not the Retina
+  resolution of the screen.
 
 ## Signing in
 
@@ -271,6 +349,9 @@ over:
 rexweb cookies import --domain example.com --domain idp.example.com --reload
 ```
 
+`--reload` reloads every open tab in every pane of that engine. Sleeping tabs
+get the cookies when they wake.
+
 A person must be at the screen. macOS asks for the **Chrome Safe Storage** key
 in a Keychain prompt. After the import of your identity provider's session,
 sites that sign in through it work until that session expires. Leave out
@@ -281,7 +362,8 @@ sites that sign in through it work until that session expires. Leave out
 `--engine webkit` to choose.
 
 Sign-in popups open in their own window. This lets them hand the result back to
-the page.
+the page. A page that a link opened in a new tab cannot do that: it has no
+`window.opener`.
 
 ## Configure
 
@@ -319,6 +401,7 @@ the pane headers. Floating panes and full screen work too.
 | `engine` | `"webkit"` (default) or `"chromium"`. The engine for `rexweb open`, the cookie commands, and links that you click in Rex. |
 | `chromium_port` | Port of the local RexWebChromium server. Default 18803. |
 | `chromium_debug_port` | Port for the Chrome DevTools Protocol. Default 0, which means off. Read [the warning](#the-devtools-protocol-port) first. |
+| `tab_unload_minutes` | Minutes before an idle background [tab](#tabs) is put to sleep. Default 30. 0 turns it off. |
 
 If a pane sits off its place, set `top`, `left`, `right`, `bottom`, `gap`,
 `header`, or `radius`. Values are in points. They replace the values that
@@ -330,7 +413,7 @@ are open, also run `pkill -x RexWebChromium`.
 ## Troubleshooting
 
 - Run `rexweb doctor`. It prints one `ok` or `FAIL` line for each check. It exits 1 if any check fails. Fix each `FAIL` line as it says.
-- To restart RexWeb, run `pkill -x RexWeb`. Panes come back within 2 seconds.
+- To restart RexWeb, run `pkill -x RexWeb`. Panes come back within 2 seconds, with their tabs.
 - To restart the Chromium engine, run `pkill -x RexWebChromium`. `rexweb doctor` checks it only if it is installed.
 - If the Rex server restarts, browser panes come back as plain shells. Close them and open new ones.
 - If the problem stays, run `./install.sh` again.
@@ -351,6 +434,10 @@ RexWeb listens on 127.0.0.1 only. Every request needs the token in
 `RexWebChromium.app` works the same way with Chromium windows. It has its own
 port and shares the token. The `rexweb` command sends each request to the app
 that owns the pane.
+
+Each app saves its panes' tabs in `~/.rexweb/tabs-webkit.json` or
+`~/.rexweb/tabs-chromium.json`. It reads the file when a pane comes back
+after a restart. Entries older than 30 days are dropped.
 
 One side effect: clicking into a page makes RexWeb the active app, so Rex's
 title bar dims.

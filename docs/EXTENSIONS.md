@@ -1,6 +1,6 @@
 # What this fork adds to rexweb
 
-This fork extends [rexweb](https://github.com/acoyfellow/rexweb) in two ways:
+This fork extends [rexweb](https://github.com/acoyfellow/rexweb) in three ways:
 
 1. **Console logging for WebKit (Safari engine) panes.** `rexweb console` and
    `rexweb html` let a script or an agent read a page's console output and
@@ -8,9 +8,12 @@ This fork extends [rexweb](https://github.com/acoyfellow/rexweb) in two ways:
 2. **A Chromium engine.** A second app, `RexWebChromium.app`, draws panes
    with Chromium (through CEF) and adds a network log, the DevTools window,
    raw DevTools Protocol commands, and an optional debugging port.
+3. **Tabs inside a pane.** A browser pane holds several pages, in both
+   engines. Tabs come back after a restart, and idle ones are unloaded.
 
-The work sits on the branch `feat/cef-engine`, nine commits on top of upstream
-commit `e23cb9c`. Nothing has been pushed.
+Parts 1 and 2 sit on the branch `feat/cef-engine`, ten commits on top of
+upstream commit `e23cb9c`. Part 3 sits on the branch `feat/tabs`, which is
+built on `feat/cef-engine`. Nothing has been pushed.
 
 For day-to-day usage, read [README.md](../README.md) and
 [AGENTS.md](../AGENTS.md). This document explains what changed and why.
@@ -37,6 +40,11 @@ console patch closes the first gap. The Chromium engine closes the second.
 | `616d1fa` | Fix load waits, token repair and CLI issues found in review |
 | `c26dbae` | Fix scripted click and press on Chromium panes |
 | `81260aa` | Add `rexweb cdp`; refuse a pane fragment matched in both apps |
+| `b3b8608` | Add this document |
+| `0cc8651` | Add tabs to the pane core (`feat/tabs`) |
+| `249a671` | Open links as tabs in WebKit panes |
+| `5cd19d6` | Open links as tabs in Chromium panes |
+| `c07bc78` | Add tab commands and `--tab` to the CLI |
 
 ## Part 1: console logging for WebKit panes
 
@@ -66,9 +74,9 @@ Levels are `log`, `info`, `warn`, `error`, `debug` and `navigation`.
 - Each message is posted to the app through a WebKit script message handler
   named `rexwebConsole`. The original console method still runs, so Web
   Inspector shows the same output.
-- The app keeps the last 1000 messages per pane, each with a sequence number.
+- The app keeps the last 1000 messages per tab, each with a sequence number.
   `dropped` counts messages that fell off the front.
-- A `navigation` entry is recorded whenever the pane commits a new page, so a
+- A `navigation` entry is recorded whenever the tab commits a new page, so a
   log that spans page loads stays readable.
 
 ### Limits
@@ -89,7 +97,7 @@ Levels are `log`, `info`, `warn`, `error`, `debug` and `navigation`.
 - **False "Uncaught Script error."** `rexweb eval` first tries the code as an
   expression and retries it as statements. The failed first attempt leaked
   into the console log as an error. The app now ignores that one message
-  while an `eval` is probing (`probingUntil` in `Panel`).
+  while an `eval` is probing (`probingUntil` in `Tab`).
 
 ## Part 2: the Chromium engine
 
@@ -138,7 +146,8 @@ chromium/                     SwiftPM package for RexWebChromium.app
 
 - `Core.swift` talks to an engine through `protocol PageEngine` (load,
   navigate, run script, click, press, screenshot, focus, close) and a small
-  `Engine` hook table (name, factory, cookie setter, extra routes).
+  `Engine` hook table (name, factory, cookie setter, extra routes, and the
+  routes that need their tab on show).
 - The two apps are separate processes with separate ports. They share the
   token file `~/.rexweb/token`. The CLI lists panes from both and routes each
   command to the owner.
@@ -154,16 +163,15 @@ chromium/                     SwiftPM package for RexWebChromium.app
   app, with no open port:
   - `Runtime.evaluate` runs scripts (`eval`, `snapshot`, `html`, `type`).
   - `Runtime`, `Log` and `Page` events feed the console log.
-  - `Network` events feed the network log: the last 1000 requests per pane,
+  - `Network` events feed the network log: the last 1000 requests per tab,
     with status, type and failure reason. Headers and bodies are not kept.
   - `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent` deliver `click`
     and `press`. `Page.captureScreenshot` takes screenshots.
 - `rexweb devtools` opens CEF's own DevTools window for the pane.
 - `rexweb cdp METHOD [PARAMS]` passes one protocol command straight through
   and prints the result.
-- `Cmd`-click opens the link in a new pane beside, with the same engine. A
-  sized `window.open` becomes a native popup. Other new-window requests load
-  in place.
+- A sized `window.open` becomes a native popup. Other new-window requests
+  open a tab; see [Part 3](#part-3-tabs-inside-a-pane).
 
 ### Configuration
 
@@ -188,6 +196,225 @@ make install-chromium            # Chromium app only
 
 The first Chromium build downloads CEF. The app is signed ad hoc.
 
+## Part 3: tabs inside a pane
+
+### What you get
+
+A pane holds one or more tabs, and shows one. A pane with one tab looks and
+behaves as it did before. With two or more, a 26-point strip of tabs sits
+above the address bar, with a close button per tab and a `+` button.
+
+| Action | Result |
+|---|---|
+| `Cmd`-click a link | New tab behind the current one, placed right after it |
+| `Shift-Cmd`-click a link | New tab in front, placed right after the current one |
+| `Shift`-click a link (Chromium panes) | New tab in front |
+| `target="_blank"` link, `window.open` with no size | New tab in front |
+| `window.open` with a size | Native popup window, as before |
+| `Cmd-Opt`-click a link | New pane beside |
+| `Cmd-T` | New blank tab at the end, with the address bar focused |
+| `Cmd-W` | Close the tab; on the last tab, close the pane |
+| `Ctrl-Tab`, `Ctrl-Shift-Tab` | Next and previous tab, wrapping round |
+
+```sh
+rexweb tabs [--json]                 # list the pane's tabs
+rexweb tab new [URL] [--background] [--no-wait]
+rexweb tab select TAB                # show a tab
+rexweb tab close [TAB]               # close a tab; the last one closes the pane
+rexweb eval --tab t2 'document.title'   # --tab or -t on every page command
+```
+
+`tabs` prints one line per tab: position, ID, a mark for the showing tab,
+title and URL, with `[asleep]` on a sleeping tab. `tab new` prints the new
+tab's ID and then waits for the page, as `open` does. `tab ls` is the same
+as `tabs`. `rexweb ls` adds `[3 tabs]` to a pane that has more than one, and
+a command that prints one pane adds `[tab t2, 2 of 3]`.
+
+`--tab` is refused by `close`, `ls`, `doctor`, `tabs` and `tab new`. On
+`open` it keeps its older meaning: put the pane in a new Rex tab. `rexweb
+close` closes the whole pane and now refuses positional arguments.
+
+### Decisions, and why
+
+- **Links open tabs, not panes.** Before this, `Cmd`-click split the Rex
+  layout every time. A tab keeps the layout as it is. A pane beside is still
+  one modifier away.
+- **The strip hides for one tab.** A pane that never opens a second tab
+  loses no space and looks as upstream's does.
+- **A tab opened from a link has no `window.opener`.** It is a separate
+  page, not a child of the page that opened it, and the `window.open` call
+  that made it returns null. Sign-in flows that hand a
+  result back to their opener use sized popups, and those still open as
+  native windows and keep their opener.
+- **Only shortcuts that Rex does not need.** The tab shortcuts apply while a
+  browser pane has the keyboard. `Cmd-1` to `Cmd-9`, `Shift-Cmd-[` and
+  `Shift-Cmd-]` are left to Rex, where they switch Rex's own tabs.
+- **Agent commands leave the visible tab alone.** An agent working in a
+  background tab must not pull the page out from under the person. Only a
+  command that cannot work on a hidden page switches tabs, and it switches
+  back. In practice that is `screenshot` in a WebKit pane.
+- **No tab argument means the showing tab.** Every script written before
+  tabs keeps working.
+
+### Design
+
+Everything that belongs to one page moved from `Panel` to a new class, `Tab`,
+in `Sources/Core.swift`: the engine, the console log, the load waiters, the
+last load error, and the engine callbacks. `Panel` keeps the overlay window,
+the toolbar, the tab strip, and what the Rex tracker uses. `Panel.engine`
+returns the showing tab's engine, so the tracker and the key handler did not
+change. Engines now take a `Tab` where they took a `Panel`.
+
+- **IDs.** Each pane numbers its tabs `t1`, `t2`, and so on from its own
+  counter. An ID is not reused while the app runs. The API and the CLI take
+  an ID or a position counted from 1.
+- **Live and asleep.** A tab is live, with an engine, or asleep, with only
+  its URL, title and console log. This one state serves both session restore
+  and unloading. Reading `tab.engine` wakes a tab: it makes the engine, puts
+  its view in the pane, and loads the saved URL. Code that lists tabs reads
+  `url`, `title` and `isLive`, which never wake one.
+- **Views.** Every live tab's view is a subview of the pane's root view, and
+  all but the showing one are hidden. Each gets the page rectangle.
+- **Repaint only on change.** The strip compares its items before it
+  redraws, and layout sets a frame only when it differs. A control in a Rex
+  pane that repaints constantly drives Rex's CPU up.
+
+### Links, per engine
+
+- **WebKit.** The navigation delegate sees the modifier keys of a clicked
+  link: Command opens a background tab, with Shift a foreground tab, with
+  Option a pane beside. A new-window request with no size, such as a
+  `target="_blank"` link or `window.open(url)`, opens a tab. A request with
+  a size opens a native popup. So does a `window.open` with no URL or an
+  `about:` URL, even without a size, so that a page that opens a blank
+  window and fills it in keeps working.
+- **Chromium.** CEF reports a disposition, not the keys, and only requests
+  that come from a user gesture and carry a URL are handled. A
+  background-tab disposition (`Cmd`-click) opens a background tab. A
+  foreground-tab or new-window disposition (`Shift-Cmd`-click,
+  `Shift`-click, `target="_blank"`, an unsized `window.open`) opens a
+  foreground tab. A split-view disposition, which is how Chromium reports
+  `Cmd-Opt`-click, opens a pane beside. A popup disposition opens a native
+  popup, which keeps its opener.
+- **Both.** A tab that would open in front does so only if the page that
+  asked is the showing tab. A page in a background tab opens its tab in the
+  background.
+
+### Commands on a background tab
+
+A command for a tab that is not showing runs on the hidden page. `Engine`
+holds a set of routes that need their tab on show, `needsVisible`, and each
+app sets it for its engine. For a route in the set the pane borrows the
+view: it selects the tab, waits 150 ms, runs the command, and selects the
+earlier tab once the command has replied.
+
+| Engine | Routes that show the tab first |
+|---|---|
+| WebKit | `screenshot` |
+| Chromium | none |
+
+- **WebKit.** `click`, `type` and `press` reach a background tab because the
+  engine sends mouse and key events straight to the web view, not through
+  the window. A background tab is a hidden page: `visibilityState` is
+  `"hidden"`, no animation frames run, CSS transitions stand still, and
+  timers fire about once a second. That is why `screenshot` shows the tab
+  first.
+- **Chromium.** Input and screenshots go through the DevTools Protocol and
+  run in place. A screenshot is one pixel per CSS pixel of the tab's
+  viewport. The engine tells Chromium when a tab's view is hidden, and
+  keeps focus emulation on only for the tab on show, so a background tab is
+  a hidden page here too: `visibilityState` is `"hidden"`, no animation
+  frames run, and timers fire about once a second. A screenshot of it still
+  shows the page as it is now.
+
+In both engines, a page that only renders inside `requestAnimationFrame`
+does not update while its tab is in the background.
+
+The borrow has three rules:
+
+- A second such command for another tab of the same pane waits for the
+  first, for up to 30 seconds, and then fails.
+- If the person selects a tab while one is borrowed, their choice stands and
+  the pane does not switch back.
+- A borrow is given up after 60 seconds even if its command never replies.
+
+### Session restore
+
+Each app writes its panes' tabs to `~/.rexweb/tabs-<engine>.json`, mode 600,
+about a second after any change:
+
+```json
+{ "<pane ID>": { "active": 1, "saved": 1795000000,
+                 "tabs": [ { "url": "...", "title": "..." } ] } }
+```
+
+`active` is the showing tab's position counted from 0, and `saved` is when
+the entry was written.
+
+- When a pane registers and the file has an entry for its ID, the pane gets
+  those tabs back and the URL that the pane script sends is ignored. Only
+  the tab that was showing is live. The rest start asleep.
+- Blank tabs are not restored. If the showing tab was blank, the nearest
+  earlier tab shows. If every tab was blank, the pane starts fresh.
+- Restored tabs are numbered from `t1` again.
+- Closing the pane removes its entry. The pane script reports the close
+  when its Rex pane goes away. Killing the app reports nothing, and that is
+  the case to restore.
+- Entries older than 30 days are dropped when the file is read. An open
+  pane's entry is renewed once a day, so only panes that went away without
+  a close are pruned.
+
+### Unloading
+
+Once a minute, each app puts to sleep every background tab that is live, is
+not loading, has no command waiting on a load, and was last used more than
+`tab_unload_minutes` ago. "Used" means selected, or addressed by an API
+command other than `info`. The showing tab never sleeps.
+
+A sleeping tab reloads its URL when it is selected or when a command is
+aimed at it. The command waits for that load, for up to 30 seconds, before it
+runs. `info` and `console` answer without waking the tab. `nav` wakes it
+straight onto the new URL.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tab_unload_minutes` | 30 | Minutes before an idle background tab is unloaded. 0 turns unloading off |
+
+### API
+
+Every pane route accepts `tab`. The pane's `info` gains `tab`, `tab_index`,
+`tabs`, `tab_active` and `tab_asleep`.
+
+| Route | Input | What it does |
+|---|---|---|
+| `/tabs` | | Lists the pane's tabs: `{id, active, tabs: [{id, index, url, title, active, asleep, loading}]}` |
+| `/tab/new` | `url`, `background` | Opens a tab at the end and returns its `info` |
+| `/tab/select` | `tab` | Shows a tab, waking it if needed |
+| `/tab/close` | `tab` | Closes a tab, the showing one by default. Returns `{id, closed, pane_closed, tabs, active}` |
+
+`/cookies/import` with `reload` reloads every live tab of every pane, not
+only the showing ones. Sleeping tabs read the new cookies when they wake.
+
+### Limits
+
+- A tab that sleeps loses its back and forward history and its page state:
+  form input, scroll position, and anything held in JavaScript. It reloads
+  from its URL only.
+- A Chromium tab that sleeps also loses its network log, which lives in the
+  engine. The console log is kept in both engines.
+- Tab IDs do not survive a restart.
+- A restored pane keeps its tabs' URLs and titles, nothing else. No history
+  comes back for any tab, the showing one included.
+- A tab opened from a link has no `window.opener`.
+- A page in a background tab runs as a hidden page in both engines, with
+  slow timers and no animation frames. Only the showing tab reports focused
+  and visible.
+- `screenshot` of a background WebKit tab flicks the pane to that tab and
+  back, which the person sees.
+- A Chromium screenshot is at 1x, not at the screen's Retina scale.
+- Tabs cannot be reordered, dragged between panes, or pinned, and there is
+  no shortcut to reopen a closed tab.
+
 ## Fixes that apply to both engines
 
 - **Rex server CPU.** Upstream's window tracker ran `rex` commands whose own
@@ -209,9 +436,13 @@ The first Chromium build downloads CEF. The app is signed ad hoc.
 | `nav`, `back`, `forward` hung or returned early on Chromium | Load end was inferred from one event | Track an expected load with a grace period and the delegate's finish call |
 | A CSP-blocked request stayed "pending" | The failure event arrived before the request event | Stash early events and apply them when the request appears |
 | Scripted `click` and `press` did nothing on Chromium | Press and release went out as unordered tasks, and Chromium ignores scripted input on an unfocused page | Send each gesture's events in order; turn on focus emulation |
+| `type` into a rich editor (`contenteditable`) silently did nothing on Chromium, and focus emulation was never actually on | A DevTools command sent without a completion handler was never sent | Send first, then call the handler if there is one |
+| Scripted clicks were dropped on WebKit when RexWeb was not the active app; a click or key press could land on the wrong tab or in the address field | Events went through the window, which routes them by app and focus state | Send mouse and key events straight to the web view |
 
-Focus emulation has one visible effect: a page in a Chromium pane always
-reports `document.hasFocus()` as true.
+Focus emulation has one visible effect: the showing tab of a Chromium pane
+reports `document.hasFocus()` as true even when the pane does not have the
+keyboard. It is on only for the tab on show; a background tab reports
+unfocused and hidden.
 
 ## Security notes
 
