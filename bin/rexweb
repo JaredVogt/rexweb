@@ -553,9 +553,20 @@ die() { echo "Error: $*" >&2; exit 1; }
 
 token() { cat "$HOME/.rexweb/token" 2>/dev/null || true; }
 
+# curl, with the token header. The header goes in on standard input, so the
+# token is never an argument that `ps` shows to other users of the Mac.
+tcurl() { printf 'x-rexweb-token: %s\n' "$(token)" | curl -s -H @- "$@"; }
+
+# What a page says is the page's to choose. Control characters and direction
+# overrides come out before they reach the caller's terminal: all of them
+# from a title or URL (clean), all but newline and tab from longer text
+# (cleantext). JSON output needs neither, since jq escapes them there.
+jq_clean='def clean: (. // "") | gsub("[[:cntrl:]\u202a-\u202e\u2066-\u2069]"; "");
+  def cleantext: (. // "") | gsub("[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]"; "");'
+
 raw() {
-  curl -s -m "${3:-1}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
-    -H "x-rexweb-token: $(token)" -d "${2:-{\}}"
+  tcurl -m "${3:-1}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
+    -d "${2:-{\}}"
 }
 
 app_path() {
@@ -584,8 +595,8 @@ route() {
   [ -z "${REXWEB_PORT:-}" ] || return 0
   local best="" bestport="" p out m hits="" apps=0
   for p in "$wport" "$cport"; do
-    out="$(curl -s -m 1 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
-      -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
+    out="$(tcurl -m 1 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
+      -d '{}' 2>/dev/null)" || continue
     # A full pane ID names one pane, whatever else the text happens to match.
     if [ -n "$block" ] && jq -e --arg b "$block" 'any(.panels[]?; .id == $b)' <<<"$out" >/dev/null 2>&1; then
       port="$p"; return 0
@@ -595,9 +606,9 @@ route() {
       <<<"$out" 2>/dev/null)" || continue
     [ -n "$m" ] || continue
     apps=$((apps + 1))
-    hits="$hits$(jq -r --arg b "$block" '.panels[]? | select((.id | endswith($b))
+    hits="$hits$(jq -r --arg b "$block" "$jq_clean"'.panels[]? | select((.id | endswith($b))
         or ((.label // .title // "") | ascii_downcase | contains($b | ascii_downcase)))
-        | "  \(.id[-6:])  \(.engine // "webkit")  \(.url // "")"' <<<"$out" 2>/dev/null)"$'\n'
+        | "  \(.id[-6:])  \(.engine // "webkit")  \(.url | clean)"' <<<"$out" 2>/dev/null)"$'\n'
     if [ -z "$best" ] || awk -v a="$m" -v b="$best" 'BEGIN { exit !(a > b) }'; then best="$m"; bestport="$p"; fi
   done
   # One app refuses a fragment that matches two of its panes. Do the same across both apps.
@@ -628,8 +639,8 @@ api() {
   # Every page command names its tab the same way. No tab means the pane's active one.
   [ -z "$tabsel" ] || body="$(jq -c --arg t "$tabsel" '.tab = $t' <<<"$body")"
   local rc=0
-  out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
-    -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" || rc=$?
+  out="$(tcurl -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
+    -H 'content-type: application/json' -d "$body")" || rc=$?
   # 28 is curl's own timeout: the app is there and still working on it.
   if [ "$rc" = 28 ]; then
     die "rexweb didn't answer within ${timeout}s. The command may still be running in the pane; check with \"rexweb info\"."
@@ -637,7 +648,7 @@ api() {
     die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
   fi
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
-  if [ "$code" -ge 400 ]; then die "$(jq -r '.error // .' <<<"$out" 2>/dev/null || echo "$out")"; fi
+  if [ "$code" -ge 400 ]; then die "$(jq -r "$jq_clean"'(.error // .) | if type == "string" then cleantext else . end' <<<"$out" 2>/dev/null || echo "$out")"; fi
   printf '%s\n' "$out"
 }
 
@@ -686,14 +697,14 @@ no_tab() { [ -z "$tabsel" ] || die "$cmd doesn't take --tab${1:+. $1}"; }
 
 # One line for a pane. In a pane with more than one tab, "ls" adds the tab
 # count, and a command that acted on one tab adds which tab that was.
-pane_line() { jq -r --arg mode "${1:-tab}" '"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .engine == "chromium" then "  [chromium]" else "" end)
+pane_line() { jq -r --arg mode "${1:-tab}" "$jq_clean"'"\(.id | .[-6:])  \(if .visible then "●" else "○" end)  \(.title | clean | .[0:48])  \(.url | clean | if length > 90 then .[0:89] + "…" else . end)" + (if .engine == "chromium" then "  [chromium]" else "" end)
   + (if (.tabs // 1) < 2 then "" elif $mode == "count" then "  [\(.tabs) tabs]" else "  [tab \(.tab), \(.tab_index) of \(.tabs)]" end)'; }
 
 print_info() { if [ "$json" = 1 ]; then jq .; else pane_line; fi; }
 
 print_tabs() {
   if [ "$json" = 1 ]; then jq . <<<"$1"
-  else jq -r '.tabs[] | "\(.index)  \(.id)  \(if .active then "●" else "○" end)  \((.title // "") | .[0:48])  \(.url | if length > 90 then .[0:89] + "…" else . end)" + (if .asleep then "  [asleep]" else "" end)' <<<"$1"; fi
+  else jq -r "$jq_clean"'.tabs[] | "\(.index)  \(.id)  \(if .active then "●" else "○" end)  \(.title | clean | .[0:48])  \(.url | clean | if length > 90 then .[0:89] + "…" else . end)" + (if .asleep then "  [asleep]" else "" end)' <<<"$1"; fi
 }
 
 # ---------------------------------------------------------------- commands
@@ -824,10 +835,10 @@ case "$cmd" in
     fi
     err=""
     if [ "$wait" = 1 ]; then
-      out="$(curl -s -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" -H "x-rexweb-token: $(token)" \
+      out="$(tcurl -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" \
         -d "$(jq -nc --arg id "$id" '{id:$id, timeout:30}')")" || out=$'{}\n000'
       code="${out##*$'\n'}"; out="${out%$'\n'*}"
-      if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null)"; fi
+      if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r "$jq_clean"'.error // "no answer" | cleantext' <<<"$out" 2>/dev/null)"; fi
     fi
     for _ in $(seq 1 30); do
       info="$(raw /info "$target_id")"
@@ -847,8 +858,8 @@ case "$cmd" in
     out='{"panels":[]}' up=0
     for p in "$wport" "$cport"; do
       [ -z "${REXWEB_PORT:-}" ] || [ "$p" = "$port" ] || continue
-      one="$(curl -s -m 2 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
-        -H "x-rexweb-token: $(token)" -d '{}' 2>/dev/null)" || continue
+      one="$(tcurl -m 2 -X POST "http://127.0.0.1:$p/list" -H 'content-type: application/json' \
+        -d '{}' 2>/dev/null)" || continue
       jq -e '.panels' >/dev/null 2>&1 <<<"$one" || continue
       up=1
       out="$(jq -c -s '{panels: (.[0].panels + .[1].panels | sort_by(-(.active // 0)))}' <<<"$out$one")"
@@ -898,10 +909,10 @@ case "$cmd" in
         id="$(jq -r .id <<<"$info")" tabsel="$(jq -r .tab <<<"$info")"
         err=""
         if [ "$wait" = 1 ] && [ -n "$url" ]; then
-          out="$(curl -s -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" -H "x-rexweb-token: $(token)" \
+          out="$(tcurl -m 35 -w '\n%{http_code}' -X POST "http://127.0.0.1:$port/loaded" \
             -d "$(jq -nc --arg id "$id" --arg t "$tabsel" '{id:$id, tab:$t, timeout:30}')")" || out=$'{}\n000'
           code="${out##*$'\n'}"; out="${out%$'\n'*}"
-          if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null)"; fi
+          if [ "$code" -ge 400 ] 2>/dev/null || [ "$code" = 000 ]; then err="$(jq -r "$jq_clean"'.error // "no answer" | cleantext' <<<"$out" 2>/dev/null)"; fi
           now="$(raw /info "$(jq -nc --arg id "$id" --arg t "$tabsel" '{id:$id, tab:$t}')" 2>/dev/null)" &&
             jq -e --arg t "$tabsel" '.tab == $t' >/dev/null 2>&1 <<<"$now" && info="$now"
         fi
@@ -938,7 +949,7 @@ case "$cmd" in
     cmd=snapshot; parse "$@"
     out="$(api /snapshot "$(target)")"
     if [ "$json" = 1 ]; then jq . <<<"$out"
-    else jq -r '"\(.title)\n\(.url)\n\nElements:\n\(.elements)\n\nText:\n\(.text)"' <<<"$out"; fi
+    else jq -r "$jq_clean"'"\(.title | clean)\n\(.url | clean)\n\nElements:\n\(.elements | cleantext)\n\nText:\n\(.text | cleantext)"' <<<"$out"; fi
     ;;
 
   click)
@@ -1009,7 +1020,7 @@ case "$cmd" in
     out="$(api /console "$(jq -nc --arg id "$block" --arg l "$levels" --argjson s "$since" --argjson n "$limit" --argjson c "$clear" \
       '{id:$id, since:$s, limit:$n, clear:$c, levels:($l | split(",") | map(select(. != "")))}')")"
     if [ "$json" = 1 ]; then jq . <<<"$out"
-    else jq -r '.messages[] | "\(.seq)\t\(.level)\t\(.text)" + (if (.source // "") != "" then "  (\(.source))" else "" end)' <<<"$out"; fi
+    else jq -r "$jq_clean"'.messages[] | "\(.seq)\t\(.level)\t\(.text | cleantext)" + (if (.source // "") != "" then "  (\(.source | clean))" else "" end)' <<<"$out"; fi
     ;;
 
   network|net)
@@ -1032,7 +1043,7 @@ case "$cmd" in
     out="$(chromium_only /network "$(jq -nc --arg id "$block" --argjson s "$since" --argjson n "$limit" --argjson c "$clear" --argjson f "$failed" \
       '{id:$id, since:$s, limit:$n, clear:$c, failed:$f}')")"
     if [ "$json" = 1 ]; then jq . <<<"$out"
-    else jq -r '.requests[] | "\(.seq)\t\(if .error then "ERR" elif .status then (.status | tostring) elif .done then "-" else "..." end)\t\(.method)\t\(.type)\t\(.url)" + (if .error then "  (\(.error))" else "" end)' <<<"$out"; fi
+    else jq -r "$jq_clean"'.requests[] | "\(.seq)\t\(if .error then "ERR" elif .status then (.status | tostring) elif .done then "-" else "..." end)\t\(.method)\t\(.type)\t\(.url | clean)" + (if .error then "  (\(.error | clean))" else "" end)' <<<"$out"; fi
     ;;
 
   cdp)
@@ -1058,7 +1069,7 @@ case "$cmd" in
     out="$(api /eval "$(jq -nc --arg id "$block" --arg s "${rest[0]:-}" \
       '{id:$id, js:("(s => { const e = s ? document.querySelector(s) : document.documentElement; return e ? e.outerHTML : null; })(" + ($s | @json) + ")")}')" 60)"
     [ "$(jq -r '.value | type' <<<"$out")" = string ] || die "no element for ${rest[0]:-the page}"
-    jq -r '.value' <<<"$out"
+    jq -r "$jq_clean"'.value | cleantext' <<<"$out"
     ;;
 
   screenshot|shot)

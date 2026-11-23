@@ -4,8 +4,8 @@ Things left open after the tabs work and the move to a public fork. Written
 2026-11-23. Tick an item off, or delete it, when it is done.
 
 Background: [docs/EXTENSIONS.md](docs/EXTENSIONS.md) explains what the fork
-adds, and [docs/tabs/PLAN.md](docs/tabs/PLAN.md) is the brief the tabs were
-built from.
+adds, and [docs/tabs/PLAN.md](docs/tabs/PLAN.md) is the design record for
+the tabs.
 
 ## Not yet checked with real input
 
@@ -16,11 +16,12 @@ mouse. Scripted tests cannot make real key presses or modifier clicks.
   while a browser pane has the keyboard.
 - [ ] **`Cmd-Q` quits Rex.** It used to quit the browser app. Confirm Rex
   comes forward and quits, in both a WebKit and a Chromium pane.
-- [ ] **Saved tabs after quitting Rex.** If quitting Rex stops the pane
-  scripts (`bin/rexweb-pane`), their exit handler calls `/close`, which
-  forgets the pane's saved tabs. Quit Rex with tabs open, reopen it, and see
-  whether the tabs return. If they do not, the script should forget a pane
-  only when the pane was closed on purpose.
+- [ ] **Saved tabs after quitting Rex.** Read, not run: the Rex server is a
+  separate background process, so quitting Rex.app should leave the pane
+  scripts (`bin/rexweb-pane`) running and the tabs in place. Quit Rex with
+  tabs open and reopen it to confirm. A stop of the Rex server does end the
+  scripts, and their exit handler then forgets the saved tabs, but those
+  panes come back as plain shells either way.
 - [ ] **Clicking the tab strip.** Select a tab, the close button on a tab,
   and the plus button.
 - [ ] **Modifier clicks on links.** `Cmd`-click (background tab),
@@ -66,19 +67,9 @@ mouse. Scripted tests cannot make real key presses or modifier clicks.
 - [ ] **Older WebKit bugs, present before the fork's tab work.** `nav` can
   return before the page has loaded. `back` can hang for about 40 seconds.
   `html SELECTOR` can fail right after such a `nav`.
-- [ ] **`Engine.needsVisible` has a dead default.** `Core.swift` lists four
-  routes, but `Sources/main.swift` and the Chromium `Main.swift` both replace
-  the set. The default should be empty or removed.
 
 ## Security and privacy
 
-- [ ] **The token is on curl's command line.** `bin/rexweb` passes the token
-  from `~/.rexweb/token` as a curl argument, so other users of the Mac can
-  read it with `ps`. Upstream does the same. Pass it through a header file or
-  standard input instead.
-- [ ] **Titles and URLs are printed raw.** `rexweb tabs`, `ls` and `info`
-  print a page's title and URL as they are, so a page can put terminal escape
-  sequences in the caller's terminal. Strip control characters.
 - [ ] **`_isPlayingAudio` is a private WebKit property.** The WebKit unload
   check reads it by name to keep a tab that is playing sound. It is the only
   signal that covers Web Audio and players inside cross-site frames, but a
@@ -86,21 +77,18 @@ mouse. Scripted tests cannot make real key presses or modifier clicks.
 
 ## Repo housekeeping
 
-- [ ] **Take or skip two upstream commits.** `3f62eb0` and `1869542` ("Guess
-  a window only for the session Rex focused last") are on `main` and not on
-  `fork`. A trial `git cherry-pick` of `3f62eb0` applied without a conflict.
-  The fork also changed how a Rex window is picked, so test window picking
-  after taking them.
+- [ ] **Test window picking after the upstream change.** `3f62eb0` and
+  `1869542` ("Guess a window only for the session Rex focused last") were
+  ported by hand into `Sources/Core.swift`; a cherry-pick no longer applies.
+  A pane now takes an unlearned Rex window only if its session is the one
+  Rex focused last. With two Rex windows, check that panes in the second
+  window appear, and how soon, after `pkill -x RexWeb`.
 - [ ] **Read the docs end to end.** `README.md`, `AGENTS.md` and
   `docs/EXTENSIONS.md` were written from the code and have not been read
   through by a person. In the "Problems found on the way" table of
   `docs/EXTENSIONS.md`, the rows on the background-tab screenshot and on
   non-web links describe the old symptom from a commit message, not from
   something seen.
-- [ ] **Decide what to do with `docs/tabs/`.** `PLAN.md` describes the state
-  before the build and says nothing is in `Sources/` yet.
-  `panel-draft.swift` has been replaced by the code in `Sources/Core.swift`.
-  Update the plan, or delete both.
 - [ ] **Delete stale local branches and refs.** `feat/tabs`,
   `feat/cef-engine` and `feat/console-capture` are all contained in `fork`.
   The tag `backup/pre-rewrite-tabs` and `refs/original/*` hold the commits

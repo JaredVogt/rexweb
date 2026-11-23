@@ -22,8 +22,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 command -v jq >/dev/null 2>&1 || { printf '  rexweb needs jq. Install it with: brew install jq\n'; sleep 3600; exit 1; }
 
 post() {
-  curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' \
-    -H "x-rexweb-token: $(cat "$HOME/.rexweb/token" 2>/dev/null)" -d "$2"
+  # The token header goes in on standard input, so `ps` never shows it.
+  printf 'x-rexweb-token: %s\n' "$(cat "$HOME/.rexweb/token" 2>/dev/null)" |
+    curl -s -m "${3:-3}" -X POST "http://127.0.0.1:$port$1" -H 'content-type: application/json' -H @- -d "$2"
 }
 
 shown=""

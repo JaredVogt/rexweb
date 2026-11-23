@@ -291,7 +291,7 @@ enum Engine {
   /// runs, and the page is hidden again after the reply. The tab on show,
   /// the keyboard, the tab strip and the address bar stay as they were. Each
   /// app sets this for its engine; a route left out runs on the hidden page.
-  static var needsVisible: Set<String> = ["/click", "/type", "/press", "/shot"]
+  static var needsVisible: Set<String> = []
 }
 
 /// One page in a pane. A pane always has at least one tab, and shows one.
