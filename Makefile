@@ -5,6 +5,12 @@ ARCH := $(shell uname -m)
 
 CAPP := chromium/dist/RexWebChromium.app
 
+# What to sign RexWeb.app with. "-" is an ad hoc signature, which changes with
+# every build, so macOS forgets permissions granted to the app. Name a signing
+# identity here or in local.mk to keep them: see `security find-identity -v -p codesigning`.
+SIGN ?= -
+-include local.mk
+
 .PHONY: build install uninstall clean chromium install-chromium
 build: $(APP)
 
@@ -13,7 +19,7 @@ $(APP): $(wildcard Sources/*.swift) Info.plist bin/rexweb-pane bin/rexweb AGENTS
 	swiftc -O -swift-version 5 -target $(ARCH)-apple-macos14 Sources/*.swift -o $(APP)/Contents/MacOS/RexWeb
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp bin/rexweb-pane bin/rexweb AGENTS.md $(APP)/Contents/Resources/
-	codesign --force --sign - $(APP)
+	codesign --force --sign "$(SIGN)" $(APP)
 	touch $(APP)
 
 install: build
