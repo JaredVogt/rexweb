@@ -128,6 +128,16 @@ enum RexChrome {
     CFPreferencesCopyAppValue("Workspace.\(key)" as CFString, domain)
   }
 
+  /// The size Rex last saved for its Settings window, or nil if it has never
+  /// shown one. AppKit saves the frame as "x y width height" and then the
+  /// screen's frame.
+  static func settingsSize() -> CGSize? {
+    let key = "NSWindow Frame com_apple_SwiftUI_Settings_window" as CFString
+    guard let s = CFPreferencesCopyAppValue(key, domain) as? String else { return nil }
+    let n = s.split(separator: " ").compactMap { Double($0) }
+    return n.count >= 4 ? CGSize(width: n[2], height: n[3]) : nil
+  }
+
   static func read() -> Insets {
     CFPreferencesAppSynchronize(domain)
     let compact = value("paneDensity") as? String == "compact"
@@ -1155,6 +1165,7 @@ final class Tracker {
     Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
     Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
       self?.insets = RexChrome.read()
+      Tracker.settingsSize = RexChrome.settingsSize()
       self?.learnWindows()
     }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
@@ -1258,6 +1269,14 @@ final class Tracker {
     return out
   }
 
+  static var settingsSize = RexChrome.settingsSize()
+
+  /// How far, in points, a pane's terminal may be from its place in a window
+  /// and still count as being there. Width and height are added together. A
+  /// true match is off by the terminal's padding and part of a cell, and by
+  /// more for a moment while the window is being resized.
+  static let looseFit = 300.0
+
   static func rexWindows() -> (rex: [RexWindow], order: [Int]) {
     let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
     var rex: [RexWindow] = []
@@ -1271,6 +1290,9 @@ final class Tracker {
       guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
             let r = CGRect(dictionaryRepresentation: bd), r.width > 200, r.height > 200 else { continue }
       guard onScreenFraction(r) >= 0.5 else { continue }
+      // Rex's Settings window is a big Rex window too, and nothing in the
+      // window list tells it from one that holds panes. Its saved size does.
+      if let s = settingsSize, abs(r.width - s.width) < 1, abs(r.height - s.height) < 1 { continue }
       let name = w[kCGWindowName as String] as? String ?? ""
       if let twin = rex.firstIndex(where: { $0.bounds == r }) {
         if rex[twin].name.isEmpty { rex[twin] = RexWindow(number: rex[twin].number, name: name, bounds: r) }
@@ -1430,8 +1452,12 @@ final class Tracker {
     if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
     if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
     let free = rexWins.filter { windowSession[$0.number] == nil }
-    if free.count == 1 { return free[0] }
-    guard free.count > 1, let g = grids[p.id] else { return nil }
+    guard let g = grids[p.id] else { return free.count == 1 ? free[0] : nil }
+    // A lone unclaimed window is only a guess. Take it if the pane's terminal
+    // is about the size of the place the pane would have there. A Rex window
+    // that holds no panes, such as a dialog, fails that.
+    if free.count == 1 { return score(free[0]) < Tracker.looseFit ? free[0] : nil }
+    guard free.count > 1 else { return nil }
     let ranked = free.map { ($0, score($0)) }.sorted { $0.1 < $1.1 }
     return ranked[1].1 - ranked[0].1 > 2 ? ranked[0].0 : nil
     func score(_ w: RexWindow) -> Double {
