@@ -139,7 +139,26 @@ final class WebKitEngine: NSObject, PageEngine, WKNavigationDelegate, WKUIDelega
     web.window?.makeFirstResponder(web)
   }
 
+  func unloadBlocker(_ done: @escaping (String?) -> Void) {
+    if !popups.isEmpty { return done("it has a popup window open") }
+    if web.cameraCaptureState != .none || web.microphoneCaptureState != .none { return done("it is using the camera or microphone") }
+    // WebKit knows about sound the probe below can't see: Web Audio, and media
+    // inside frames from other sites, such as an embedded player. It tells
+    // only through a property that isn't public, so ask for it by name and
+    // go without it if a later WebKit drops it.
+    if web.responds(to: NSSelectorFromString("_isPlayingAudio")), web.value(forKey: "_isPlayingAudio") as? Bool == true {
+      return done("it is playing audio or video")
+    }
+    web.callAsyncJavaScript(JS.unloadProbe, arguments: [:], in: nil, in: .page) { r in
+      switch r {
+      case .success(let v): done((v as? String).flatMap { $0.isEmpty ? nil : $0 })
+      case .failure: done("the page couldn't be asked whether it has unsaved work")
+      }
+    }
+  }
+
   func close() {
+    web.stopLoading()
     popups.forEach { $0.window.close() }
     popups = []
     web.configuration.userContentController.removeScriptMessageHandler(forName: "rexwebConsole")

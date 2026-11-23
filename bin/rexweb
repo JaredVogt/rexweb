@@ -627,9 +627,15 @@ api() {
   case "$path" in /list|/health|/cookies|/cookies/import|/links|/default-browser) ;; *) route ;; esac
   # Every page command names its tab the same way. No tab means the pane's active one.
   [ -z "$tabsel" ] || body="$(jq -c --arg t "$tabsel" '.tab = $t' <<<"$body")"
+  local rc=0
   out="$(curl -s -m "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:$port$path" \
-    -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" ||
+    -H 'content-type: application/json' -H "x-rexweb-token: $(token)" -d "$body")" || rc=$?
+  # 28 is curl's own timeout: the app is there and still working on it.
+  if [ "$rc" = 28 ]; then
+    die "rexweb didn't answer within ${timeout}s. The command may still be running in the pane; check with \"rexweb info\"."
+  elif [ "$rc" != 0 ]; then
     die "rexweb isn't running. Open a pane with \"rexweb open\" to start it, or run \"rexweb doctor\"."
+  fi
   code="${out##*$'\n'}"; out="${out%$'\n'*}"
   if [ "$code" -ge 400 ]; then die "$(jq -r '.error // .' <<<"$out" 2>/dev/null || echo "$out")"; fi
   printf '%s\n' "$out"

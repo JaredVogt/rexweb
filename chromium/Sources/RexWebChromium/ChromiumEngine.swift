@@ -14,6 +14,19 @@ func foundation(_ json: CefJSON) -> Any? {
   return try? JSONSerialization.jsonObject(with: json.data, options: [.fragmentsAllowed])
 }
 
+/// A reply callback that runs at most once, whichever of the answer and its
+/// timeout comes first. Only ever touched on the main thread.
+final class PendingReply: @unchecked Sendable {
+  private var done: ((CefJSON?, String?) -> Void)?
+  init(_ done: ((CefJSON?, String?) -> Void)?) { self.done = done }
+  var waiting: Bool { done != nil }
+  func finish(_ reply: CefJSON?, _ error: String?) {
+    let d = done
+    done = nil
+    d?(reply, error)
+  }
+}
+
 @MainActor
 final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   static let networkLimit = 1000
@@ -25,6 +38,8 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   var tasks: [Task<Void, Never>] = []
   /// The last batch of input events sent. See `sendInOrder`.
   var inputTail: Task<Void, Never>?
+  /// Counts batches of input, so the last one waiting can tell that it is the last.
+  var inputSeq = 0
 
   var wasLoading = false
   /// Whether the tab's view was on show when focus emulation was last set.
@@ -147,15 +162,47 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
 
   // MARK: DevTools Protocol
 
-  func send(_ method: String, _ params: CefJSON = [:], _ done: ((CefJSON?, String?) -> Void)? = nil) {
+  /// Sends one DevTools Protocol command. `done` is called once: with the
+  /// reply, with the error, or, when the page hasn't answered within
+  /// `timeout` seconds, with a message saying so. Without that a command
+  /// Chromium never answers would leave an API caller waiting for good.
+  func send(_ method: String, _ params: CefJSON = [:], timeout: Double = 25, _ done: ((CefJSON?, String?) -> Void)? = nil) {
+    let pending = PendingReply(done)
+    if done != nil {
+      DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+        pending.finish(nil, "the page didn't answer \(method) within \(Int(timeout)) seconds")
+      }
+    }
     // Await the reply before the optional call: `done?(try await …)` would
     // skip the send itself whenever there is no `done`.
     Task { @MainActor in
       do {
         let reply = try await page.devTools.send(method, params)
-        done?(reply, nil)
+        pending.finish(reply, nil)
       } catch {
-        if let done { done(nil, "\(error)") } else { log("\(method) failed: \(error)") }
+        if pending.waiting { pending.finish(nil, "\(error)") } else if done == nil { log("\(method) failed: \(error)") }
+      }
+    }
+  }
+
+  static let blockerWords: [CefPage.DiscardBlocker: String] = [
+    .visible: "it is on screen", .exempt: "Chromium protects it", .notLoaded: "it is still loading",
+    .playingAudio: "it is playing audio, or was in the last minute", .capturingMedia: "it is using the camera, microphone or screen",
+    .pictureInPicture: "it shows picture in picture", .connectedToDevice: "it is connected to a device",
+    .formInteraction: "a form on it has input that would be lost", .beforeUnloadHandler: "the page asks before it is left",
+    .devToolsOpen: "its DevTools window is open", .downloading: "a download is in progress",
+  ]
+
+  func unloadBlocker(_ done: @escaping (String?) -> Void) {
+    Task { @MainActor in
+      let blockers = await page.discardBlockers()
+      let words = blockers.map { ChromiumEngine.blockerWords[$0] ?? "Chromium couldn't tell whether it is safe (\($0))" }.sorted()
+      if !words.isEmpty { return done(words.joined(separator: "; ")) }
+      // Chromium counts only what a person typed. A field filled by a script,
+      // as `rexweb type` does, shows up only in the page itself.
+      call(JS.unloadProbe, [:]) { value, error in
+        if error != nil { return done("the page couldn't be asked whether it has unsaved work") }
+        done((value as? String).flatMap { $0.isEmpty ? nil : $0 })
       }
     }
   }
@@ -346,13 +393,24 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   /// Sends input events one after another, and after any sent before them. Chromium drops a press
   /// and its release when they arrive out of order, which separate `send` tasks do not rule out,
   /// and text typed before a key must reach the page before the key does.
+  ///
+  /// Chromium also drops clicks, keys and typed text on a page that is not focused, which a
+  /// background tab is not: focus emulation is off for it. So a batch for a hidden page turns
+  /// focus emulation on first, and off again once no later batch is waiting.
   func sendInOrder(_ steps: [(String, CefJSON)]) {
     let earlier = inputTail
+    inputSeq += 1
+    let mine = inputSeq
     inputTail = Task { @MainActor [weak self] in
       await earlier?.value
+      guard let self else { return }
+      let hidden = self.host.isHidden
+      if hidden { _ = try? await self.page.devTools.send("Emulation.setFocusEmulationEnabled", ["enabled": true]) }
       for (method, params) in steps {
-        guard let self else { return }
-        do { _ = try await self.page.devTools.send(method, params) } catch { log("\(method) failed: \(error)"); return }
+        do { _ = try await self.page.devTools.send(method, params) } catch { log("\(method) failed: \(error)"); break }
+      }
+      if hidden, mine == self.inputSeq, self.host.isHidden {
+        _ = try? await self.page.devTools.send("Emulation.setFocusEmulationEnabled", ["enabled": false])
       }
     }
   }
@@ -360,7 +418,7 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   /// A pane driven from the CLI rarely has the keyboard. Focus emulation makes the page on show
   /// act focused without taking it: `document.hasFocus()` is true and the page counts as visible.
   /// It is off for a background tab, because it would also keep that page drawing frames at full
-  /// rate while nobody can see it. Scripted input reaches a background tab without it.
+  /// rate while nobody can see it. `sendInOrder` turns it on for as long as scripted input takes.
   func emulateFocus() {
     wasShown = !host.isHidden
     send("Emulation.setFocusEmulationEnabled", ["enabled": .bool(!host.isHidden)])
@@ -390,6 +448,9 @@ final class ChromiumEngine: @preconcurrency PageEngine, CefPageDelegate {
   func focus() { if !host.isHidden { host.window?.makeFirstResponder(host) } }
 
   func close() {
+    // Nothing more is reported for a closed page, so it is not waiting on a load.
+    awaiting = false
+    queued = nil
     timer?.invalidate()
     tasks.forEach { $0.cancel() }
     tasks = []

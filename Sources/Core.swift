@@ -261,6 +261,10 @@ protocol PageEngine: AnyObject {
   /// PNG data of the page as shown.
   func screenshot(_ done: @escaping (Data?, String?) -> Void)
   func focus()
+  /// Asks whether the page can be unloaded without losing something: sound
+  /// that is playing, a popup, a half-filled form, an open DevTools window.
+  /// Calls back with nil when it can, or with a few words on what keeps it.
+  func unloadBlocker(_ done: @escaping (String?) -> Void)
   func close()
 }
 
@@ -271,10 +275,12 @@ enum Engine {
   static var setCookies: ([HTTPCookie], @escaping () -> Void) -> Void = { _, done in done() }
   /// Routes only one engine has. Returns false when the route isn't its own.
   static var route: ((String, Tab, [String: Any], @escaping (Int, Any) -> Void) -> Bool)?
-  /// API routes that only work while their tab is the one on show. A command
-  /// on one of these routes aimed at a background tab selects the tab, waits
-  /// a moment, runs, and puts the earlier tab back after it replies. Each app
-  /// sets this for its engine; a route left out runs on the hidden tab.
+  /// API routes that only work on a page that is drawing. A command on one
+  /// of these routes aimed at a background tab borrows the pane: the tab's
+  /// page is unhidden behind the tab on show, the command waits a moment and
+  /// runs, and the page is hidden again after the reply. The tab on show,
+  /// the keyboard, the tab strip and the address bar stay as they were. Each
+  /// app sets this for its engine; a route left out runs on the hidden page.
   static var needsVisible: Set<String> = ["/click", "/type", "/press", "/shot"]
 }
 
@@ -297,8 +303,12 @@ final class Tab {
   var loadWaiters: [(String?) -> Void] = []
   var lastError: String?
   var requested: URL?
-  /// When the tab was last selected or addressed by an API command.
+  /// When the tab was last selected, or a command addressed to it began or ended.
   var lastUsed = Date()
+  /// API commands running on this tab now. A busy tab is never unloaded.
+  var busy = 0
+  /// Why the unload timer last left this idle tab loaded, if it did.
+  var unloadBlocked: String?
   /// What a sleeping tab shows and reloads.
   private(set) var savedURL: String
   private(set) var savedTitle: String
@@ -315,11 +325,12 @@ final class Tab {
   var isActive: Bool { panel?.activeTab === self }
   /// The tab is the one on show in a pane that is on screen.
   var visible: Bool { (panel?.visible ?? false) && isActive }
-  /// The page's address. While a first load is still on its way, the address asked for.
+  /// The page's address. While the page has none of its own, because a first
+  /// load is on its way or failed, this is the address asked for.
   var url: String {
     guard let live else { return savedURL }
     let now = live.url?.absoluteString ?? ""
-    if now.isEmpty || now == "about:blank", let r = requested, isLoading { return r.absoluteString }
+    if now.isEmpty || now == "about:blank", let r = requested, r.scheme != "about" { return r.absoluteString }
     return live.url == nil ? savedURL : now
   }
   var title: String { live.map { $0.title } ?? savedTitle }
@@ -347,7 +358,7 @@ final class Tab {
   /// the page's history and, on Chromium, its network log go with the engine.
   func sleep() {
     guard let engine = live, !closed, !isActive else { return }
-    savedURL = engine.url?.absoluteString ?? savedURL
+    savedURL = url
     savedTitle = engine.title.isEmpty ? savedTitle : engine.title
     finishWaiters("the tab was unloaded")
     engine.view.removeFromSuperview()
@@ -359,16 +370,18 @@ final class Tab {
 
   func info() -> [String: Any] {
     ["id": panel?.id ?? "", "session": panel?.session ?? "", "url": url, "title": title,
-     "loading": isLoading, "visible": panel?.visible ?? false, "error": orNull(lastError), "engine": Engine.name,
+     "loading": isLoading, "visible": visible, "pane_visible": panel?.visible ?? false,
+     "error": orNull(lastError), "engine": Engine.name,
      "label": panel?.lastLabel ?? "", "active": (panel?.lastActive ?? Date()).timeIntervalSince1970,
      "tab": id, "tab_index": (panel?.tabs.firstIndex { $0 === self } ?? 0) + 1, "tabs": panel?.tabs.count ?? 0,
      "tab_active": isActive, "tab_asleep": !isLive]
   }
 
   /// Loads an address. On a sleeping tab this makes the engine and loads the
-  /// new address only, not the saved one first.
-  func load(_ raw: String, done: ((String?) -> Void)? = nil) {
-    guard let url = Panel.normalize(raw) else { done?("bad url"); return }
+  /// new address only, not the saved one first. `raw` is read as something a
+  /// person typed, unless `exact` says it is a whole address already.
+  func load(_ raw: String, exact: Bool = false, done: ((String?) -> Void)? = nil) {
+    guard let url = exact ? URL(string: raw) : Panel.normalize(raw) else { done?("bad url"); return }
     if closed { done?("closed"); return }
     requested = url
     if let done { loadWaiters.append(done) }
@@ -386,6 +399,8 @@ final class Tab {
   }
 
   func waitForLoad(_ done: @escaping (String?) -> Void) {
+    // A closed tab's engine reports nothing more, so a waiter would never be called.
+    if closed { done("closed"); return }
     if !engine.isLoading { done(lastError ?? refusedError); return }
     loadWaiters.append(done)
   }
@@ -432,19 +447,32 @@ final class Tab {
     finishWaiters(lastError)
   }
 
-  /// Opens `url` in a new tab of this tab's pane, placed right after this
-  /// tab. `foreground` shows the new tab; otherwise it loads behind this one.
-  /// The new tab is a separate page with no `window.opener`. Returns nil when
-  /// this tab's pane is gone.
-  @discardableResult
-  func openTab(_ url: String, foreground: Bool) -> Tab? {
-    panel?.newTab(url: url, foreground: foreground, after: self)
+  /// The kinds of address a link may open in a new tab or pane. A link of any
+  /// other kind, such as mailto: or tel:, does nothing there, as it does
+  /// nothing when clicked plainly in a pane.
+  static let linkSchemes: Set<String> = ["http", "https", "file", "about", "data", "blob"]
+
+  private func opens(_ url: String) -> Bool {
+    if let scheme = URL(string: url)?.scheme?.lowercased(), Tab.linkSchemes.contains(scheme) { return true }
+    record(level: "warn", text: "Didn't open \(url.prefix(200)): only web addresses open in a tab or pane.", url: self.url)
+    return false
   }
 
-  /// Opens `url` in a new browser pane to the right of this tab's pane, with
-  /// the same engine.
+  /// Opens `url` in a new tab of this tab's pane, placed right after this
+  /// tab. `foreground` shows the new tab; otherwise it loads behind this one.
+  /// `url` is a whole address from a link, loaded as given. The new tab is a
+  /// separate page with no `window.opener`. Returns nil when this tab's pane
+  /// is gone or the address isn't one a pane can show.
+  @discardableResult
+  func openTab(_ url: String, foreground: Bool) -> Tab? {
+    guard opens(url) else { return nil }
+    return panel?.newTab(url: url, foreground: foreground, after: self, exact: true)
+  }
+
+  /// Opens `url`, a whole address from a link, in a new browser pane to the
+  /// right of this tab's pane, with the same engine.
   func openBeside(_ url: String) {
-    guard let panel else { return }
+    guard let panel, opens(url) else { return }
     App.shared.openPane(beside: panel.id, session: panel.session, url: url)
   }
 
@@ -575,13 +603,16 @@ final class Panel: NSObject, NSTextFieldDelegate {
   let id: String
   let session: String
   private(set) var tabs: [Tab] = []
-  /// The tab on show. It is always live.
+  /// The tab on show: the one the user sees and a command with no tab acts
+  /// on. It is always live. A borrow doesn't change it.
   private(set) var activeTab: Tab!
   private var tabCounter = 0
   /// The pane was built from a saved tab list rather than started empty.
   private(set) var restored = false
-  /// Set while a command has a background tab on show for a moment. See `Engine.needsVisible`.
-  var borrow: (from: Tab, to: Tab, count: Int, token: Int)?
+  /// Set while commands have a background tab's page drawing behind the tab
+  /// on show. `count` is how many commands share it. See `Engine.needsVisible`.
+  private(set) var borrow: (to: Tab, count: Int, token: Int, started: Date)?
+  private var borrowSeq = 0
 
   /// The engine of the tab on show.
   var engine: PageEngine { activeTab.engine }
@@ -667,15 +698,25 @@ final class Panel: NSObject, NSTextFieldDelegate {
     root.addSubview(bar)
 
     // Blank tabs aren't worth bringing back; the tab on show moves to the
-    // nearest one before it that is.
+    // nearest one before it that is. Each tab keeps the ID it had, and the
+    // counter carries on from where it was, so an ID a script still holds
+    // names the same page or nothing. A file from before IDs were saved has
+    // none, and its tabs are numbered from t1.
     let saved = restore?["tabs"] as? [[String: Any]] ?? []
     let wanted = (restore?["active"] as? NSNumber)?.intValue ?? 0
+    var ids: [String?] = []
+    for s in saved {
+      let tid = s["id"] as? String ?? ""
+      let ok = tid.range(of: #"^t[1-9][0-9]{0,8}$"#, options: .regularExpression) != nil && !ids.contains(tid)
+      ids.append(ok ? tid : nil)
+    }
+    tabCounter = max((restore?["counter"] as? NSNumber)?.intValue ?? 0, ids.compactMap { $0.flatMap { Int($0.dropFirst()) } }.max() ?? 0)
     var chosen = 0
     for (i, s) in saved.enumerated() {
       let url = s["url"] as? String ?? ""
       if url.isEmpty || url == "about:blank" { continue }
       if i <= wanted { chosen = tabs.count }
-      _ = makeTab(url: url, title: s["title"] as? String ?? "", asleep: true)
+      _ = makeTab(id: ids[i], url: url, title: s["title"] as? String ?? "", asleep: true)
     }
     if tabs.isEmpty {
       activeTab = makeTab()
@@ -698,9 +739,9 @@ final class Panel: NSObject, NSTextFieldDelegate {
 
   // MARK: Tabs
 
-  private func makeTab(url: String = "", title: String = "", asleep: Bool = false, at index: Int? = nil) -> Tab {
-    tabCounter += 1
-    let t = Tab(panel: self, id: "t\(tabCounter)", url: url, title: title, asleep: asleep)
+  private func makeTab(id: String? = nil, url: String = "", title: String = "", asleep: Bool = false, at index: Int? = nil) -> Tab {
+    if id == nil { tabCounter += 1 }
+    let t = Tab(panel: self, id: id ?? "t\(tabCounter)", url: url, title: title, asleep: asleep)
     tabs.insert(t, at: min(index ?? tabs.count, tabs.count))
     if t.isLive { attach(t) }
     return t
@@ -711,7 +752,55 @@ final class Panel: NSObject, NSTextFieldDelegate {
     guard let root = window.contentView, let view = t.live?.view, tabs.contains(where: { $0 === t }) else { return }
     view.isHidden = !(activeTab === t)
     if view.superview !== root { root.addSubview(view, positioned: .below, relativeTo: bar) }
+    orderPages()
     layout()
+  }
+
+  private static func rank(_ v: NSView, in p: Panel) -> Int {
+    v === p.bar || v === p.strip ? 2 : (v === p.activeTab?.live?.view ? 1 : 0)
+  }
+
+  /// Keeps the page on show above every other page, so a page that a borrow
+  /// unhides stays out of sight and out of reach of the mouse.
+  private func orderPages() {
+    window.contentView?.sortSubviews({ a, b, context in
+      let p = Unmanaged<Panel>.fromOpaque(context!).takeUnretainedValue()
+      let x = Panel.rank(a, in: p), y = Panel.rank(b, in: p)
+      return x < y ? .orderedAscending : (x > y ? .orderedDescending : .orderedSame)
+    }, context: Unmanaged.passUnretained(self).toOpaque())
+  }
+
+  // MARK: Borrowing
+
+  /// Whether a command on `t` must wait for another tab's borrow to end.
+  func borrowedByAnother(_ t: Tab) -> Bool { borrow != nil && borrow!.to !== t }
+
+  /// Has a background tab's page draw, behind the tab on show, until the
+  /// matching `endBorrow`. Calls `ready` once the page has had a moment to
+  /// start drawing, with the token to end the borrow with. A second command
+  /// on the same tab shares the borrow and waits out what is left of that moment.
+  func beginBorrow(_ t: Tab, ready: @escaping (Int) -> Void) {
+    let settle = 0.15
+    if var b = borrow {
+      b.count += 1
+      borrow = b
+      let left = max(0, settle - Date().timeIntervalSince(b.started))
+      if left == 0 { return ready(b.token) }
+      return DispatchQueue.main.asyncAfter(deadline: .now() + left) { ready(b.token) }
+    }
+    borrowSeq += 1
+    let token = borrowSeq
+    borrow = (to: t, count: 1, token: token, started: Date())
+    t.engine.view.isHidden = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + settle) { ready(token) }
+  }
+
+  func endBorrow(_ token: Int) {
+    guard var b = borrow, b.token == token else { return }
+    b.count -= 1
+    if b.count > 0 { borrow = b; return }
+    borrow = nil
+    if b.to !== activeTab { b.to.live?.view.isHidden = true }
   }
 
   /// Finds a tab by its ID, such as t3, or by its position counted from 1.
@@ -725,11 +814,12 @@ final class Panel: NSObject, NSTextFieldDelegate {
   }
 
   /// Adds a tab, after `after` or at the end, and loads `url` in it if given.
+  /// `exact` is for a whole address, as `Tab.load` takes it.
   @discardableResult
-  func newTab(url: String, foreground: Bool, after: Tab? = nil) -> Tab {
+  func newTab(url: String, foreground: Bool, after: Tab? = nil, exact: Bool = false) -> Tab {
     let index = after.flatMap { a in tabs.firstIndex { $0 === a } }.map { $0 + 1 }
     let t = makeTab(at: index)
-    if !url.isEmpty { t.load(url) }
+    if !url.isEmpty { t.load(url, exact: exact) }
     if foreground { select(t) } else { tabsChanged() }
     return t
   }
@@ -739,24 +829,24 @@ final class Panel: NSObject, NSTextFieldDelegate {
     focusURL()
   }
 
-  /// Shows a tab, waking it if it is asleep. `transient` is for a command
-  /// that borrows the pane for a moment: it leaves a half-typed address alone.
-  func select(_ t: Tab, transient: Bool = false) {
+  /// Shows a tab, waking it if it is asleep.
+  func select(_ t: Tab) {
     guard tabs.contains(where: { $0 === t }) else { return }
     t.lastUsed = Date()
-    if !transient { borrow = nil }
+    t.unloadBlocked = nil
     guard let old = activeTab, old !== t else { return }
     old.lastUsed = Date()
-    let editing = editingURL
-    if editing, !transient { urlField.abortEditing() }
+    if editingURL { urlField.abortEditing() }
     activeTab = t
     let view = t.engine.view
-    old.live?.view.isHidden = true
+    // A page that a command has borrowed stays drawing, now behind this one.
+    if borrow?.to !== old { old.live?.view.isHidden = true }
     view.isHidden = false
+    orderPages()
     layout()
     // Keys sent to the window go to its first responder, which must not stay
     // the page that was just hidden. This doesn't bring the window forward.
-    if !editing || !transient { t.engine.focus() }
+    t.engine.focus()
     tabsChanged()
   }
 
@@ -773,7 +863,7 @@ final class Panel: NSObject, NSTextFieldDelegate {
   func closeTab(_ t: Tab) {
     guard let i = tabs.firstIndex(where: { $0 === t }) else { return }
     if tabs.count == 1 { Rex.async(["block", "close", id]); return }
-    if let b = borrow, b.from === t || b.to === t { borrow = nil }
+    if borrow?.to === t { borrow = nil }
     tabs.remove(at: i)
     if activeTab === t {
       let editing = editingURL
@@ -782,6 +872,7 @@ final class Panel: NSObject, NSTextFieldDelegate {
       activeTab.lastUsed = Date()
       t.close()
       activeTab.engine.view.isHidden = false
+      orderPages()
       activeTab.engine.focus()
     } else {
       t.close()
@@ -813,27 +904,47 @@ final class Panel: NSObject, NSTextFieldDelegate {
     layout()
   }
 
-  /// Puts background tabs nobody has used for `minutes` to sleep.
+  /// A background tab nothing is using: no command running on it or waiting
+  /// for it, not loading, not borrowed, and untouched since `cutoff`.
+  private func isIdle(_ t: Tab, since cutoff: Date) -> Bool {
+    t.isLive && !t.isActive && t.busy == 0 && t.lastUsed < cutoff && !t.isLoading && t.loadWaiters.isEmpty
+      && borrow?.to !== t && tabs.contains { $0 === t }
+  }
+
+  /// Puts background tabs nobody has used for `minutes` to sleep, each one
+  /// only if its engine says nothing would be lost. A tab that is kept says
+  /// why in `unloadBlocked`.
   func sleepIdleTabs(olderThan minutes: Double) {
     let cutoff = Date().addingTimeInterval(-minutes * 60)
-    var slept = false
-    for t in tabs where t.isLive && !t.isActive && t.lastUsed < cutoff && !t.isLoading && t.loadWaiters.isEmpty {
-      if let b = borrow, b.from === t || b.to === t { continue }
-      t.sleep()
-      slept = true
+    for t in tabs where isIdle(t, since: cutoff) {
+      guard let engine = t.live else { continue }
+      var answered = false
+      let decide = { [weak self, weak t] (reason: String?) in
+        guard !answered else { return }
+        answered = true
+        guard let self, let t else { return }
+        if let reason { t.unloadBlocked = reason; return }
+        guard self.isIdle(t, since: cutoff) else { return }
+        t.unloadBlocked = nil
+        t.sleep()
+        self.refreshStrip()
+      }
+      engine.unloadBlocker(decide)
+      // No answer keeps the tab: better loaded than wrongly unloaded.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 10) { decide("the page didn't answer whether it could be unloaded") }
     }
-    if slept { refreshStrip() }
   }
 
   /// What session restore keeps for this pane.
-  var savedState: (active: Int, tabs: [[String: String]]) {
-    (tabs.firstIndex { $0 === activeTab } ?? 0, tabs.map { ["url": $0.url, "title": $0.title] })
+  var savedState: (active: Int, counter: Int, tabs: [[String: String]]) {
+    (tabs.firstIndex { $0 === activeTab } ?? 0, tabCounter, tabs.map { ["id": $0.id, "url": $0.url, "title": $0.title] })
   }
 
   func tabsInfo() -> [String: Any] {
     ["id": id, "active": activeTab.id, "tabs": tabs.enumerated().map { i, t -> [String: Any] in
       ["id": t.id, "index": i + 1, "url": t.url, "title": t.title, "active": t === activeTab,
-       "asleep": !t.isLive, "loading": t.isLoading]
+       "asleep": !t.isLive, "loading": t.isLoading,
+       "unload_blocked": orNull(t.isLive && !t.isActive ? t.unloadBlocked : nil)]
     }]
   }
 
@@ -1558,6 +1669,31 @@ enum JS {
   })();
   """#
 
+  /// What an engine's `unloadBlocker` asks the page. It answers with the reason to keep
+  /// the page, or an empty string. A video that plays without sound doesn't
+  /// count; a field counts once it holds something other than what the page
+  /// put there.
+  static let unloadProbe = #"""
+  const sounding = m => !m.paused && !m.ended && !m.muted && m.volume > 0;
+  if ([...document.querySelectorAll('video,audio')].some(sounding)) return 'it is playing audio or video';
+  if (window.onbeforeunload) return 'the page asks before it is left';
+  const skip = ['hidden', 'submit', 'button', 'reset', 'image'];
+  const changed = e => {
+    if (e.disabled) return false;
+    if (e instanceof HTMLSelectElement) {
+      const o = [...e.options];
+      return o.some(x => x.defaultSelected) ? o.some(x => x.selected !== x.defaultSelected) : (!e.multiple && e.selectedIndex > 0) || (e.multiple && e.selectedIndex >= 0);
+    }
+    if (e instanceof HTMLTextAreaElement) return e.value !== e.defaultValue;
+    if (skip.includes(e.type)) return false;
+    if (e.type === 'checkbox' || e.type === 'radio') return e.checked !== e.defaultChecked;
+    if (e.type === 'file') return e.files.length > 0;
+    return e.value !== e.defaultValue;
+  };
+  if ([...document.querySelectorAll('input,textarea,select')].some(changed)) return 'a form on it has input that would be lost';
+  return '';
+  """#
+
   static let exists = #"""
   if (args.selector) return !!document.querySelector(args.selector);
   if (args.text) return (document.body?.innerText || '').includes(args.text);
@@ -1667,6 +1803,7 @@ final class App: NSObject, NSApplicationDelegate {
     server.start()
     tracker.start()
     startTabTimer()
+    saveOnTerminate()
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in self?.key(e) == true ? nil : e }
     log("listening on 127.0.0.1:\(config.port)")
   }
@@ -1790,18 +1927,44 @@ final class App: NSObject, NSApplicationDelegate {
     for p in panels.values {
       let s = p.savedState
       if let old = savedTabs[p.id], (old["active"] as? NSNumber)?.intValue == s.active,
-         (old["tabs"] as? [[String: String]]) == s.tabs,
+         (old["counter"] as? NSNumber)?.intValue == s.counter, (old["tabs"] as? [[String: String]]) == s.tabs,
          now - ((old["saved"] as? NSNumber)?.doubleValue ?? 0) < 86400 { continue }
-      savedTabs[p.id] = ["active": s.active, "saved": now, "tabs": s.tabs]
+      savedTabs[p.id] = ["active": s.active, "counter": s.counter, "saved": now, "tabs": s.tabs]
       savedTabsDirty = true
     }
     guard savedTabsDirty else { return }
     guard let data = try? JSONSerialization.data(withJSONObject: savedTabs, options: [.sortedKeys]) else { return }
-    do {
-      try data.write(to: tabsFile, options: .atomic)
-      try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tabsFile.path)
+    // The list names every page open, so it is never readable by others, not
+    // even for a moment: written to a private file, then moved into place.
+    let tmp = tabsFile.appendingPathExtension("new-\(ProcessInfo.processInfo.processIdentifier)")
+    unlink(tmp.path)
+    let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    guard fd >= 0 else { return log("couldn't save tabs: \(String(cString: strerror(errno)))") }
+    let wrote = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    Darwin.close(fd)
+    if wrote == data.count, rename(tmp.path, tabsFile.path) == 0 {
       savedTabsDirty = false
-    } catch { log("couldn't save tabs: \(error.localizedDescription)") }
+    } else {
+      log("couldn't save tabs: \(String(cString: strerror(errno)))")
+      unlink(tmp.path)
+    }
+  }
+
+  func applicationWillTerminate(_ n: Notification) { saveTabs() }
+
+  var termSignal: DispatchSourceSignal?
+
+  /// The apps are usually stopped with `pkill`, which sends SIGTERM and would
+  /// lose a tab change made in the last second. Save, then go.
+  func saveOnTerminate() {
+    signal(SIGTERM, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    source.setEventHandler { [weak self] in
+      self?.saveTabs()
+      exit(0)
+    }
+    source.resume()
+    termSignal = source
   }
 
   func forgetTabs(_ id: String) {
@@ -1831,8 +1994,8 @@ final class App: NSObject, NSApplicationDelegate {
     t.engine.call(body, args, done)
   }
 
-  /// Routes that answer from what a sleeping tab keeps, or that wake it themselves.
-  static let noWake: Set<String> = ["/info", "/console", "/nav", "/open", "/focus"]
+  /// Routes that wake a sleeping tab themselves and don't wait for its page.
+  static let noWake: Set<String> = ["/nav", "/open", "/focus"]
 
   func handle(path: String, input: [String: Any], reply: @escaping (Int, Any) -> Void) {
     let ok = { (v: Any) in reply(200, v) }
@@ -1928,7 +2091,7 @@ final class App: NSObject, NSApplicationDelegate {
     guard let t = p.tab(input["tab"]) else {
       return fail("no tab \(input["tab"] ?? "") in this pane. Use a tab ID such as t1, or a position from 1 to \(p.tabs.count)")
     }
-    if route != "/info" { p.lastActive = Date(); t.lastUsed = Date() }
+    if route != "/info" { p.lastActive = Date(); t.lastUsed = Date(); t.unloadBlocked = nil }
 
     switch route {
     case "/tabs":
@@ -1947,80 +2110,85 @@ final class App: NSObject, NSApplicationDelegate {
       p.closeTab(t)
       return ok(["id": p.id, "closed": t.id, "pane_closed": last, "tabs": last ? 0 : p.tabs.count,
                  "active": last ? NSNull() as Any : p.activeTab.id as Any])
+    case "/info", "/console":
+      return run(route, p, t, input, reply)
     default: break
     }
 
+    // The command counts as running on its tab until it has replied, which
+    // keeps the tab from being unloaded under it.
+    t.busy += 1
+    var replied = false
+    dispatch(route, p, t, input) { status, out in
+      guard !replied else { return }
+      replied = true
+      t.busy -= 1
+      t.lastUsed = Date()
+      reply(status, out)
+    }
+  }
+
+  /// How long a command waits for a sleeping tab to load before it gives up.
+  /// It is shorter than the 30 seconds the CLI waits for an answer.
+  static let wakeTimeout = 20.0
+
+  /// Gets a pane and tab ready for a page command, then runs it. The pane
+  /// and tab were resolved once, by `handle`; a step that has to wait comes
+  /// back here with the same two, never by looking them up again.
+  func dispatch(_ route: String, _ p: Panel, _ t: Tab, _ input: [String: Any], waited: Int = 0, _ reply: @escaping (Int, Any) -> Void) {
+    let fail = { (s: String) in reply(400, ["error": s]) }
+    guard panels[p.id] === p else { return fail("the pane was closed") }
+    guard p.tabs.contains(where: { $0 === t }) else { return fail("the tab was closed") }
+
     if ["/click", "/type", "/press"].contains(route), !p.visible {
-      func retry(_ left: Int) {
-        if p.visible { return handle(path: path, input: input, reply: reply) }
-        if left == 0 {
-          return fail("this pane isn't on screen, so it can't take clicks or typing. Show its Rex window and try again. eval, snapshot, and screenshot still work.")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { retry(left - 1) }
+      if waited >= 12 {
+        return fail("this pane isn't on screen, so it can't take clicks or typing. Show its Rex window and try again. eval, snapshot, and screenshot still work.")
       }
-      return retry(12)
+      return DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.dispatch(route, p, t, input, waited: waited + 1, reply) }
     }
 
     // A sleeping tab wakes and finishes loading before the command runs.
+    // /loaded and /wait do their own waiting, with the caller's timeout.
     if !t.isLive, !App.noWake.contains(route) {
-      var input = input
-      input["tab"] = t.id
       _ = t.engine
+      if route == "/loaded" || route == "/wait" { return run(route, p, t, input, reply) }
       var went = false
-      let go = {
+      t.waitForLoad { err in
         guard !went else { return }
         went = true
+        if err == "closed" { return fail("the tab was closed") }
         // Waking reloaded the page already.
-        if route == "/reload" { return ok(t.info()) }
-        self.handle(path: path, input: input, reply: reply)
+        if route == "/reload" { return reply(200, t.info()) }
+        self.dispatch(route, p, t, input, reply)
       }
-      t.waitForLoad { _ in go() }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 30) { go() }
+      DispatchQueue.main.asyncAfter(deadline: .now() + App.wakeTimeout) {
+        guard !went else { return }
+        went = true
+        reply(408, ["error": "the tab was unloaded and is still loading after \(Int(App.wakeTimeout))s, so the command didn't run. Wait for it with `rexweb wait -t \(t.id)`, then try again.", "url": t.url])
+      }
       return
     }
 
-    guard Engine.needsVisible.contains(route) else { return run(route, p, t, input, reply) }
+    guard Engine.needsVisible.contains(route), t !== p.activeTab || p.borrow?.to === t else { return run(route, p, t, input, reply) }
 
-    // The command needs its tab on show. Wait for any other command that has
-    // borrowed the pane, then borrow it: select, pause, run, put back.
-    func whenFree(_ left: Int) {
-      if let b = p.borrow, b.to !== t {
-        if left == 0 { return fail("another command is still using this pane's visible tab. Try again.") }
-        return DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { whenFree(left - 1) }
-      }
-      guard p.tabs.contains(where: { $0 === t }) else { return fail("the tab was closed") }
-      if p.borrow != nil {
-        p.borrow!.count += 1
-        return run(route, p, t, input, returning(p, t, reply))
-      }
-      if t === p.activeTab { return run(route, p, t, input, reply) }
-      borrowSeq += 1
-      p.borrow = (from: p.activeTab, to: t, count: 1, token: borrowSeq)
-      p.select(t, transient: true)
-      let done = returning(p, t, reply)
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { self.run(route, p, t, input, done) }
+    // The command needs its tab's page drawing. One tab at a time is
+    // borrowed, so wait out a borrow of another tab first.
+    if p.borrowedByAnother(t) {
+      if waited >= 300 { return fail("another command is still using this pane. Try again.") }
+      return DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.dispatch(route, p, t, input, waited: waited + 1, reply) }
     }
-    whenFree(300)
-  }
-
-  var borrowSeq = 0
-
-  /// Wraps a reply so that, once it is sent, a borrowed pane shows the tab it showed before.
-  func returning(_ p: Panel, _ t: Tab, _ reply: @escaping (Int, Any) -> Void) -> (Int, Any) -> Void {
-    guard let token = p.borrow?.token else { return reply }
-    var released = false
-    let release = { [weak p] in
-      guard !released else { return }
-      released = true
-      guard let p, var b = p.borrow, b.token == token else { return }
-      b.count -= 1
-      if b.count > 0 { p.borrow = b; return }
-      p.borrow = nil
-      if p.activeTab === b.to, p.tabs.contains(where: { $0 === b.from }) { p.select(b.from, transient: true) }
+    p.beginBorrow(t) { [weak p] token in
+      var ended = false
+      let end = {
+        guard !ended else { return }
+        ended = true
+        p?.endBorrow(token)
+      }
+      // A command that never replies must not keep the page drawing for good.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 60) { end() }
+      guard let p else { return }
+      self.run(route, p, t, input) { status, out in reply(status, out); end() }
     }
-    // A command that never replies must not hold the pane for good.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 60) { release() }
-    return { status, out in reply(status, out); release() }
   }
 
   /// Runs a page command on a live tab.
@@ -2136,6 +2304,8 @@ final class App: NSObject, NSApplicationDelegate {
         if let err { return reply(502, ["error": err, "url": t.url]) }
         poll()
       }
+      // The load itself can outlast the timeout; the first reply wins.
+      DispatchQueue.main.asyncAfter(deadline: .now() + deadline.timeIntervalSinceNow + 0.5) { reply(408, ["error": "timed out"]) }
     default:
       if Engine.route?(route, t, input, reply) == true { return }
       reply(404, ["error": "unknown route \(route)"])
