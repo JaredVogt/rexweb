@@ -475,6 +475,120 @@ comes back after a restart. Entries older than 30 days are dropped.
 One side effect: clicking into a page makes RexWeb the active app, so Rex's
 title bar dims.
 
+## Taking changes from upstream
+
+This fork has two long-lived branches:
+
+- `main` is a copy of upstream's `main`. Never commit to it.
+- `fork` is upstream plus everything this fork adds. It is the default
+  branch, and it is what you build and install.
+
+Upstream changes are not pulled in automatically. You look at what is new and
+choose what to take.
+
+### Set up once
+
+A fresh clone knows only this fork. Add upstream as a second remote:
+
+```sh
+git remote add upstream https://github.com/acoyfellow/rexweb
+git fetch upstream
+git branch --set-upstream-to=upstream/main main
+```
+
+### See what is new
+
+```sh
+git fetch upstream
+git switch main && git merge --ff-only upstream/main
+git push origin main                  # keep the fork's copy current
+git log --oneline fork..main          # upstream commits that fork lacks
+git show <hash>                       # read one before deciding
+```
+
+`--ff-only` fails if `main` has a commit of its own. That means something was
+committed to `main` by mistake; move it to `fork` before going on.
+
+### Take one change
+
+```sh
+git switch fork
+git cherry-pick -x <hash>
+```
+
+`-x` adds the upstream hash to the commit message, so the history shows where
+the change came from. To take several, list them oldest first:
+`git cherry-pick -x <hash1> <hash2>`.
+
+### Take everything
+
+```sh
+git switch fork
+git merge main
+```
+
+Use a merge here, not a rebase. A rebase replays every fork commit on top of
+the new upstream and can raise the same conflict many times. A merge raises it
+once.
+
+### Pick one method and keep to it
+
+A merge brings in every upstream commit that `fork` lacks, including ones you
+skipped earlier. So:
+
+- If you want to stay close to upstream and only delay some changes, cherry-pick
+  when you are in a hurry and merge when you are ready for the rest.
+- If you want to leave some upstream changes out for good, only ever
+  cherry-pick. Do not merge `main`.
+
+After cherry-picks, `git log fork..main` still lists the commits you took,
+because a cherry-pick is a new commit. `git cherry -v fork main` shows the
+real state: a line that starts with `-` is already in `fork`, and a line that
+starts with `+` is not.
+
+### Where conflicts come from
+
+Upstream keeps the whole app in one file, `Sources/RexWeb.swift`. This fork
+split that file in three:
+
+| File | Holds |
+|---|---|
+| `Sources/Core.swift` | Everything that does not depend on the engine: config, the Rex tracker, the local API, panes and tabs, injected scripts |
+| `Sources/WebKitEngine.swift` | The WebKit web view and its delegates |
+| `Sources/main.swift` | The app's entry point |
+
+Git treats `Core.swift` as the renamed `RexWeb.swift`, so an upstream change
+to code that now lives in `Core.swift` usually applies by itself. An upstream
+change to web view code conflicts in `Core.swift`, because that code is no
+longer there. Resolve it by hand:
+
+```sh
+git show <hash> -- Sources/RexWeb.swift    # what upstream changed
+```
+
+Make the same change in `Sources/WebKitEngine.swift`, take the fork's side of
+`Core.swift`, then `git add` both files and run `git cherry-pick --continue`
+(or `git merge --continue`). Ask whether the Chromium engine in
+`chromium/Sources/RexWebChromium/ChromiumEngine.swift` needs the same change;
+upstream does not have that file, so nothing will remind you.
+
+`README.md`, `AGENTS.md`, `bin/rexweb`, `install.sh` and `lua/init.lua` are
+changed in both places and can conflict too. Keep both sides' changes.
+
+To back out of a conflict, run `git cherry-pick --abort` or
+`git merge --abort`.
+
+### Check, then install
+
+```sh
+./install.sh --with-chromium
+rexweb doctor
+```
+
+Open a WebKit pane and a Chromium pane and try the commands you rely on
+before you push. An upstream change that applied without a conflict can still
+break something the fork added.
+
 ## License
 
 MIT. rexweb is a community project. Superlogical does not maintain or endorse
