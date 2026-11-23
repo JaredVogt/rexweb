@@ -144,7 +144,7 @@ the tab that is showing, its title, and its URL. A sleeping tab ends with
 `tab new` prints the ID of the new tab: `t1`, `t2`, and so on. Then it waits
 for the page to load, as `open` does. Use `--no-wait` to skip the wait. Where
 a command takes a tab, it accepts the ID or the tab's position, counted
-from 1. IDs start again from `t1` when RexWeb restarts. `rexweb ls` adds
+from 1. A tab keeps its ID when RexWeb restarts. `rexweb ls` adds
 `[3 tabs]` to a pane that has more than one. Closing a pane's last tab closes
 the pane. `rexweb close` closes the whole pane, with every tab in it.
 
@@ -157,6 +157,13 @@ unloaded to give its memory back. Its tab stays in the strip, dimmed, and the
 page loads again when you select it. A tab that slept loses its back and
 forward history. Set `tab_unload_minutes` to change the time, or to 0 to turn
 this off. See [Configure](#configure).
+
+A tab is not unloaded while it would lose something: it plays sound, uses
+the camera or microphone, has a form with input in it, asks before it is
+left, or has a popup, a download, or a DevTools window open.
+
+A `Cmd`-click, a `target="_blank"` link, or a `window.open` opens a tab or
+pane only for a web address. A `mailto:` or `tel:` link opens nothing there.
 
 ### Open Rex's links in Rex
 
@@ -229,11 +236,10 @@ written before tabs work unchanged.
 rexweb eval -b "$id" --tab t2 'document.title'
 ```
 
-A command on a background tab does not change the tab that you see. There is
-one exception. In a WebKit pane, `screenshot` shows the tab for a moment,
-takes the picture, and switches back. In a Chromium pane, no command shows
-the tab. A command for a sleeping tab wakes the tab and waits for its page to
-load.
+A command on a background tab does not change the tab that you see, the
+address bar, or where the keyboard is. A command for a sleeping tab wakes the
+tab and waits for its page to load. If the page takes more than 20 seconds,
+the command fails without running.
 
 [AGENTS.md](AGENTS.md) is the guide for coding agents. `rexweb skill` prints
 the same guide.
@@ -436,8 +442,8 @@ port and shares the token. The `rexweb` command sends each request to the app
 that owns the pane.
 
 Each app saves its panes' tabs in `~/.rexweb/tabs-webkit.json` or
-`~/.rexweb/tabs-chromium.json`. It reads the file when a pane comes back
-after a restart. Entries older than 30 days are dropped.
+`~/.rexweb/tabs-chromium.json` (mode 600). It reads the file when a pane
+comes back after a restart. Entries older than 30 days are dropped.
 
 One side effect: clicking into a page makes RexWeb the active app, so Rex's
 title bar dims.

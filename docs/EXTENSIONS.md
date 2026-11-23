@@ -45,6 +45,8 @@ console patch closes the first gap. The Chromium engine closes the second.
 | `249a671` | Open links as tabs in WebKit panes |
 | `5cd19d6` | Open links as tabs in Chromium panes |
 | `c07bc78` | Add tab commands and `--tab` to the CLI |
+| `3141744` | Document tabs |
+| `f7296d8` | Fix tab defects found in review |
 
 ## Part 1: console logging for WebKit panes
 
@@ -250,9 +252,15 @@ close` closes the whole pane and now refuses positional arguments.
   browser pane has the keyboard. `Cmd-1` to `Cmd-9`, `Shift-Cmd-[` and
   `Shift-Cmd-]` are left to Rex, where they switch Rex's own tabs.
 - **Agent commands leave the visible tab alone.** An agent working in a
-  background tab must not pull the page out from under the person. Only a
-  command that cannot work on a hidden page switches tabs, and it switches
-  back. In practice that is `screenshot` in a WebKit pane.
+  background tab must not pull the page out from under the person. No
+  command switches tabs. A command that needs a page that is drawing, which
+  is `screenshot` in a WebKit pane, has the page drawn behind the one on
+  show. An earlier version switched tabs and switched back; that moved the
+  address bar and the keyboard, and a command without a tab could land on
+  the borrowed tab.
+- **Do not unload what would be lost.** Freeing memory is not worth a
+  half-filled form or a call in progress, so a tab with something to lose
+  stays loaded and says why.
 - **No tab argument means the showing tab.** Every script written before
   tabs keeps working.
 
@@ -266,8 +274,9 @@ returns the showing tab's engine, so the tracker and the key handler did not
 change. Engines now take a `Tab` where they took a `Panel`.
 
 - **IDs.** Each pane numbers its tabs `t1`, `t2`, and so on from its own
-  counter. An ID is not reused while the app runs. The API and the CLI take
-  an ID or a position counted from 1.
+  counter. An ID is not reused, and the IDs and the counter are saved, so
+  an ID that a script holds names the same page after a restart, or nothing.
+  The API and the CLI take an ID or a position counted from 1.
 - **Live and asleep.** A tab is live, with an engine, or asleep, with only
   its URL, title and console log. This one state serves both session restore
   and unloading. Reading `tab.engine` wakes a tab: it makes the engine, puts
@@ -303,12 +312,19 @@ change. Engines now take a `Tab` where they took a `Panel`.
 ### Commands on a background tab
 
 A command for a tab that is not showing runs on the hidden page. `Engine`
-holds a set of routes that need their tab on show, `needsVisible`, and each
-app sets it for its engine. For a route in the set the pane borrows the
-view: it selects the tab, waits 150 ms, runs the command, and selects the
-earlier tab once the command has replied.
+holds a set of routes that need a page that is drawing, `needsVisible`, and
+each app sets it for its engine. For a route in the set the pane borrows the
+page: it unhides the tab's view behind the view of the tab on show, waits
+150 ms, runs the command, and hides the view again once the command has
+replied. The tab on show, the strip, the address bar and the keyboard focus
+do not change, and the borrowed page stays out of sight and out of reach of
+the mouse.
 
-| Engine | Routes that show the tab first |
+The pane and the tab are resolved once per command. A command that has to
+wait, for a wake or for a borrow, continues with the same two. If either has
+gone it fails with "the pane was closed" or "the tab was closed".
+
+| Engine | Routes that borrow the page |
 |---|---|
 | WebKit | `screenshot` |
 | Chromium | none |
@@ -317,46 +333,56 @@ earlier tab once the command has replied.
   engine sends mouse and key events straight to the web view, not through
   the window. A background tab is a hidden page: `visibilityState` is
   `"hidden"`, no animation frames run, CSS transitions stand still, and
-  timers fire about once a second. That is why `screenshot` shows the tab
-  first.
+  timers fire about once a second. That is why `screenshot` has the page
+  drawn first.
 - **Chromium.** Input and screenshots go through the DevTools Protocol and
   run in place. A screenshot is one pixel per CSS pixel of the tab's
   viewport. The engine tells Chromium when a tab's view is hidden, and
   keeps focus emulation on only for the tab on show, so a background tab is
   a hidden page here too: `visibilityState` is `"hidden"`, no animation
   frames run, and timers fire about once a second. A screenshot of it still
-  shows the page as it is now.
+  shows the page as it is now. Scripted input on a background tab turns
+  focus emulation on while the input is delivered, so `document.hasFocus()`
+  can read true there for that time; the page stays hidden and does not
+  draw. A DevTools call that the page never answers fails after 25 seconds,
+  which caps `eval` and `cdp`.
 
 In both engines, a page that only renders inside `requestAnimationFrame`
 does not update while its tab is in the background.
 
 The borrow has three rules:
 
-- A second such command for another tab of the same pane waits for the
-  first, for up to 30 seconds, and then fails.
-- If the person selects a tab while one is borrowed, their choice stands and
-  the pane does not switch back.
+- One tab is borrowed at a time. A command for another tab of the same pane
+  waits for the first, for up to 30 seconds, and then fails. Commands for
+  the same tab share the borrow.
+- If the person selects another tab meanwhile, the borrowed page keeps
+  drawing behind it until its command replies.
 - A borrow is given up after 60 seconds even if its command never replies.
 
 ### Session restore
 
-Each app writes its panes' tabs to `~/.rexweb/tabs-<engine>.json`, mode 600,
-about a second after any change:
+Each app writes its panes' tabs to `~/.rexweb/tabs-<engine>.json` about a
+second after any change, and once more when it quits or gets SIGTERM, which
+is what `pkill` sends. The file lists every open page, so it is written to
+a new file created at mode 600 and then moved into place.
 
 ```json
-{ "<pane ID>": { "active": 1, "saved": 1795000000,
-                 "tabs": [ { "url": "...", "title": "..." } ] } }
+{ "<pane ID>": { "active": 1, "counter": 4, "saved": 1795000000,
+                 "tabs": [ { "id": "t2", "url": "...", "title": "..." } ] } }
 ```
 
-`active` is the showing tab's position counted from 0, and `saved` is when
-the entry was written.
+`active` is the showing tab's position counted from 0, `counter` is the
+highest tab number the pane has given out, and `saved` is when the entry was
+written.
 
 - When a pane registers and the file has an entry for its ID, the pane gets
   those tabs back and the URL that the pane script sends is ignored. Only
   the tab that was showing is live. The rest start asleep.
 - Blank tabs are not restored. If the showing tab was blank, the nearest
   earlier tab shows. If every tab was blank, the pane starts fresh.
-- Restored tabs are numbered from `t1` again.
+- Each tab keeps its ID, and the counter carries on. A blank tab's ID is
+  gone with the tab. A file from before IDs were saved has none, and its
+  tabs are numbered from `t1`.
 - Closing the pane removes its entry. The pane script reports the close
   when its Rex pane goes away. Killing the app reports nothing, and that is
   the case to restore.
@@ -366,15 +392,37 @@ the entry was written.
 
 ### Unloading
 
-Once a minute, each app puts to sleep every background tab that is live, is
-not loading, has no command waiting on a load, and was last used more than
+Once a minute, each app looks for background tabs that are live, are not
+loading, have no command running or waiting, and were last used more than
 `tab_unload_minutes` ago. "Used" means selected, or addressed by an API
 command other than `info`. The showing tab never sleeps.
 
+Each such tab's engine is then asked whether anything would be lost
+(`PageEngine.unloadBlocker`). A tab with a reason to stay is kept, and the
+reason shows as `unload_blocked` in `/tabs`. A page that does not answer
+within 10 seconds is kept too.
+
+| Keeps a tab loaded | WebKit | Chromium |
+|---|---|---|
+| Playing audio | yes | yes, and for a minute after |
+| Camera or microphone in use | yes | yes, and screen capture |
+| A form field changed by the person or a script | yes | yes |
+| A `beforeunload` handler | `window.onbeforeunload` only | yes |
+| A popup window open | yes | no |
+| DevTools open, a download running, picture in picture, a connected device | no | yes |
+
+WebKit asks the web view and a script in the page (`JS.unloadProbe`).
+Chromium asks its own tab-discard rules first and then runs the same script,
+because Chromium counts only what a person typed, not what `rexweb type`
+filled in.
+
 A sleeping tab reloads its URL when it is selected or when a command is
-aimed at it. The command waits for that load, for up to 30 seconds, before it
-runs. `info` and `console` answer without waking the tab. `nav` wakes it
-straight onto the new URL.
+aimed at it. The command waits for that load before it runs. If the page has
+not loaded after 20 seconds, the command fails without running and tells the
+caller to run `rexweb wait -t TAB` and try again. The limit is below the 30
+seconds that the CLI waits for an answer. `wait` wakes the tab and uses its
+own timeout. `info` and `console` answer without waking the tab. `nav` wakes
+it straight onto the new URL.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -383,11 +431,13 @@ straight onto the new URL.
 ### API
 
 Every pane route accepts `tab`. The pane's `info` gains `tab`, `tab_index`,
-`tabs`, `tab_active` and `tab_asleep`.
+`tabs`, `tab_active` and `tab_asleep`. `visible` is now per tab: the pane is
+on screen and the tab is the one on show. The new `pane_visible` holds the
+pane-level value that `visible` used to.
 
 | Route | Input | What it does |
 |---|---|---|
-| `/tabs` | | Lists the pane's tabs: `{id, active, tabs: [{id, index, url, title, active, asleep, loading}]}` |
+| `/tabs` | | Lists the pane's tabs: `{id, active, tabs: [{id, index, url, title, active, asleep, loading, unload_blocked}]}` |
 | `/tab/new` | `url`, `background` | Opens a tab at the end and returns its `info` |
 | `/tab/select` | `tab` | Shows a tab, waking it if needed |
 | `/tab/close` | `tab` | Closes a tab, the showing one by default. Returns `{id, closed, pane_closed, tabs, active}` |
@@ -402,15 +452,20 @@ only the showing ones. Sleeping tabs read the new cookies when they wake.
   from its URL only.
 - A Chromium tab that sleeps also loses its network log, which lives in the
   engine. The console log is kept in both engines.
-- Tab IDs do not survive a restart.
-- A restored pane keeps its tabs' URLs and titles, nothing else. No history
-  comes back for any tab, the showing one included.
+- A restored pane keeps its tabs' IDs, URLs and titles, nothing else. No
+  history comes back for any tab, the showing one included.
 - A tab opened from a link has no `window.opener`.
 - A page in a background tab runs as a hidden page in both engines, with
   slow timers and no animation frames. Only the showing tab reports focused
   and visible.
-- `screenshot` of a background WebKit tab flicks the pane to that tab and
-  back, which the person sees.
+- `screenshot` of a background WebKit tab takes about 150 ms longer, while
+  the page is drawn behind the one on show. Screenshots of two different
+  background tabs of one pane run one after the other.
+- A link, `target="_blank"` or `window.open` to anything but `http`,
+  `https`, `file`, `about`, `data` or `blob` opens no tab or pane. The
+  opener tab's console gets a warning.
+- On WebKit, a `beforeunload` handler added with `addEventListener` does not
+  keep a tab from being unloaded; only `window.onbeforeunload` is seen.
 - A Chromium screenshot is at 1x, not at the screen's Retina scale.
 - Tabs cannot be reordered, dragged between panes, or pinned, and there is
   no shortcut to reopen a closed tab.
@@ -438,10 +493,20 @@ only the showing ones. Sleeping tabs read the new cookies when they wake.
 | Scripted `click` and `press` did nothing on Chromium | Press and release went out as unordered tasks, and Chromium ignores scripted input on an unfocused page | Send each gesture's events in order; turn on focus emulation |
 | `type` into a rich editor (`contenteditable`) silently did nothing on Chromium, and focus emulation was never actually on | A DevTools command sent without a completion handler was never sent | Send first, then call the handler if there is one |
 | Scripted clicks were dropped on WebKit when RexWeb was not the active app; a click or key press could land on the wrong tab or in the address field | Events went through the window, which routes them by app and focus state | Send mouse and key events straight to the web view |
+| During a screenshot of a background tab, the address bar, shortcuts and commands without a tab acted on the borrowed tab | The borrow selected the tab and selected the earlier one afterward | Draw the borrowed page behind the page on show; the active tab never changes |
+| A command that woke a sleeping tab could run on another pane, or run late after its caller had given up | The command was looked up again by pane and tab after the wait, and ran anyway after 30 seconds | Resolve the pane and tab once; fail after 20 seconds without running |
+| Unloading threw away form input, playing audio and open popups | The timer looked only at idle time | Ask the engine first, and keep a tab that has something to lose |
+| Tab IDs changed on restart, so a script's ID could name a different page | IDs were renumbered from `t1` | Save each tab's ID and the pane's counter |
+| A tab change in the last second before `pkill` was lost; the session file was briefly readable by others | The save was debounced, and the mode was set after the write | Save on quit and on SIGTERM; create the file at mode 600 |
+| A Chromium command could hang for good | A DevTools call that the page never answered had no timeout | Time out after 25 seconds |
+| Scripted input did nothing on a background Chromium tab | Focus emulation is off for a hidden tab, and Chromium drops input on an unfocused page | Turn focus emulation on for the batch of input, then off |
+| A link to a non-web scheme, such as `mailto:`, was handed to a new tab or pane | Any address was passed on | Open only web schemes; log a console warning for the rest |
+| The CLI said "rexweb isn't running" when a command was only slow | Every curl failure was read the same way | Report curl's timeout as "didn't answer within Ns" |
 
 Focus emulation has one visible effect: the showing tab of a Chromium pane
 reports `document.hasFocus()` as true even when the pane does not have the
-keyboard. It is on only for the tab on show; a background tab reports
+keyboard. It is on only for the tab on show, and for a background tab while
+scripted input is delivered to it; otherwise a background tab reports
 unfocused and hidden.
 
 ## Security notes

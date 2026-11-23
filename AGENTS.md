@@ -20,7 +20,7 @@ The script asks no questions and is safe to run again. It ends with
 
 Update with `git -C ~/src/rexweb pull && ~/src/rexweb/install.sh`. Reinstalling
 restarts RexWeb, so open panes go blank for about 2 seconds and reload. Their
-tabs come back with new IDs; see [Tabs](#tabs).
+tabs come back with the same IDs; see [Tabs](#tabs).
 
 The Chromium engine is optional: `~/src/rexweb/install.sh --with-chromium`. It
 needs macOS 15 or later and full Xcode (`swift package --version` succeeds).
@@ -80,7 +80,16 @@ rexweb close -b "$id"
   CORS refusals) or network traffic, and pages opened from `file://` report
   uncaught errors only as "Script error." A Chromium pane captures those
   messages; see below.
-- Errors go to stderr as `Error: ...`, with exit status 1.
+- Errors go to stderr as `Error: ...`, with exit status 1. Two of them are
+  about rexweb itself, and they differ. `rexweb didn't answer within Ns. The
+  command may still be running in the pane; check with "rexweb info".` means
+  the app is up and the command ran out of time. `rexweb isn't running.`
+  means nothing is listening.
+- A command whose pane or tab goes away while it waits fails with `the pane
+  was closed` or `the tab was closed`.
+- In a Chromium pane, the page has 25 seconds to answer a DevTools call.
+  That caps `eval` and `cdp`: a longer one fails with `the page didn't
+  answer METHOD within 25 seconds`.
 
 ## Tabs
 
@@ -102,10 +111,10 @@ rexweb tab close -b "$id" "$t"
 - **Addressing.** A tab has an ID: `t1`, `t2`, and so on, counted per pane.
   `--tab` takes the ID or the tab's position, counted from 1. Prefer the ID.
   Positions shift when a tab opens or closes; an ID stays with its tab and
-  is not reused while the app runs. An unknown tab exits 1.
-- **IDs do not survive a restart.** When RexWeb restarts, a pane's tabs come
-  back numbered from `t1` in their order, and blank tabs are dropped. After a
-  restart, run `rexweb tabs` again before you pass an ID.
+  is not reused. An unknown tab exits 1.
+- **IDs survive a restart.** When RexWeb restarts, each tab comes back with
+  the ID it had, and new tabs carry on from the old count. Blank tabs are
+  not restored, so a blank tab's ID answers "no tab" afterward.
 - **`--tab` and `open`.** `--tab TAB`, `--tab=TAB`, or `-t TAB` works on
   every page command: `nav`, `snapshot`, `click`, `type`, `press`, `eval`,
   `wait`, `screenshot`, `console`, `html`, `back`, `forward`, `reload`,
@@ -117,8 +126,12 @@ rexweb tab close -b "$id" "$t"
   adds `[3 tabs]` to a pane with more than one. A command that prints a pane
   line adds `[tab t2, 2 of 3]` in such a pane.
 - **`tabs --json`** prints `{id, active, tabs}`. Each tab is
-  `{id, index, url, title, active, asleep, loading}`. Listing never wakes a
-  sleeping tab.
+  `{id, index, url, title, active, asleep, loading, unload_blocked}`.
+  Listing never wakes a sleeping tab.
+- **`visible` is per tab.** In `info --json`, `visible` is true only when
+  the pane is on screen and this tab is the one showing, so it is false for
+  every background tab. `pane_visible` is the pane alone. `click`, `type`,
+  and `press` need `pane_visible`, not `visible`.
 - **`info --json`** adds `tab` (the ID), `tab_index` (position from 1),
   `tabs` (how many the pane has), `tab_active`, and `tab_asleep`. With
   `--tab` it describes that tab. `ls --json` describes each pane's showing
@@ -144,17 +157,24 @@ rexweb tab close -b "$id" "$t"
   `window.open` with no URL or an `about:` URL. A page that a link opened in
   a tab has no `window.opener`, and the `window.open` call that made it
   returns null.
+- **Only web addresses open.** A link or `window.open` to a scheme other
+  than `http`, `https`, `file`, `about`, `data`, or `blob`, such as
+  `mailto:` or `tel:`, opens no tab or pane. The opener tab's console gets
+  a `warn` line that starts `Didn't open`.
 
 ### Background tabs
 
-A command aimed at a background tab does not change the tab the pane shows.
-That includes `click`, `type`, and `press`, which act on the hidden page.
-They still need the pane itself on screen, as before.
+A command aimed at a background tab does not change the tab the pane shows,
+the tab strip, the address bar, or where the keyboard is. That includes
+`click`, `type`, `press`, and `screenshot`. The first three still need the
+pane itself on screen, as before.
 
-- **WebKit: `screenshot` shows the tab.** The pane switches to the tab for
-  about 150 ms, takes the picture, and switches back. The person sees the
-  flick. A second screenshot of a different tab of the same pane waits for
-  the first; if it waits 30 seconds, it exits 1, so run it again.
+- **WebKit: `screenshot` draws the page out of sight.** For the shot, the
+  background page is drawn behind the page on show for about 150 ms, then
+  hidden again. The person sees no change. A screenshot of a different
+  background tab of the same pane waits for the first; if it waits 30
+  seconds, it exits 1 with `another command is still using this pane`, so
+  run it again.
 - **Chromium: no command shows the tab.** `screenshot` runs in place too,
   and shows the page as it is now.
 - **A background tab is a hidden page, in both engines.** Only the showing
@@ -182,14 +202,35 @@ and its console log are kept. Tabs sleep in two cases:
 - A background tab that was neither selected nor addressed by a command for
   `tab_unload_minutes` (default 30; 0 turns this off) is unloaded. Any
   command with `--tab` counts as use, except `info`. So a tab you poll stays
-  awake.
+  awake. A tab is never unloaded while a command is running on it.
+
+An idle tab is kept loaded while unloading would lose something. Then its
+`unload_blocked` in `tabs --json` holds the reason, such as `a form on it
+has input that would be lost`; otherwise it is null.
+
+- Both engines: the tab plays audio (a muted video does not count), uses the
+  camera or microphone, has a form field that the person or a script
+  changed, or the page asks before it is left (`beforeunload`).
+- WebKit only: the tab has a popup window open.
+- Chromium only: the tab's DevTools window is open, a download is running,
+  it captures the screen, shows picture in picture, or is connected to a
+  device. Chromium counts audio for a minute after it stops.
+
+So a tab you `type` into without submitting stays loaded.
 
 `tabs --json` shows `asleep`, and `info --json` shows `tab_asleep`. You do
 not need to check before a command:
 
 - A command aimed at a sleeping tab wakes it, waits for the page to load, and
-  then runs. Allow for the load time. If the page is still loading after 30
-  seconds, the command runs anyway.
+  then runs. Allow for the load time. If the page has not loaded after 20
+  seconds, the command fails without running, with this error. Do what it
+  says.
+
+  ```
+  Error: the tab was unloaded and is still loading after 20s, so the command didn't run. Wait for it with `rexweb wait -t t2`, then try again.
+  ```
+
+- `wait` on a sleeping tab wakes it and uses its own `--timeout`.
 - `info` and `console` answer from what the sleeping tab kept and do not wake
   it. `nav` wakes it and loads the new URL without loading the old one first.
 - `tab select` wakes the tab but does not wait for the load. Follow it with
@@ -290,7 +331,7 @@ tabs you are working in. Sleeping tabs get the cookies when they wake.
 1. Run `rexweb doctor` and fix what it reports.
 2. Restart RexWeb: `pkill -x RexWeb`. Panes come back within 2 seconds. For
    Chromium panes, restart `pkill -x RexWebChromium` instead. Tabs come back
-   too, but with new IDs and with every tab except the showing one asleep.
+   too, with their IDs, and with every tab except the showing one asleep.
 3. Read what the pane itself says: `rex capture -b "$id"`. It prints the URL,
    or why it can't reach RexWeb.
 4. If the Rex server restarted, old browser panes are now plain shells.
