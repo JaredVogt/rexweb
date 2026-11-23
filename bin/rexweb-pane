@@ -3,6 +3,16 @@
 # view over this pane's body; this process keeps the pane alive, re-registers
 # the panel if RexWeb restarts, and closes the panel when the pane goes away.
 set -u
+
+# This script is a pane's own program. Run by hand, or by an agent's shell
+# tool, it would turn the caller's pane into a browser pane and cover it, so
+# it refuses an option-like argument and any output that isn't a terminal.
+case "${1:-}" in -*) by_hand=1 ;; *) by_hand=0 ;; esac
+[ -t 1 ] || by_hand=1
+if [ "$by_hand" = 1 ]; then
+  echo "rexweb-pane holds a Rex pane for a browser and isn't run by hand. Use: rexweb open [URL]" >&2
+  exit 2
+fi
 PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
 cfg="$HOME/.rexweb/config.json"
