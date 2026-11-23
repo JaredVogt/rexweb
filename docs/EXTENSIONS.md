@@ -11,9 +11,9 @@ This fork extends [rexweb](https://github.com/acoyfellow/rexweb) in three ways:
 3. **Tabs inside a pane.** A browser pane holds several pages, in both
    engines. Tabs come back after a restart, and idle ones are unloaded.
 
-Parts 1 and 2 sit on the branch `feat/cef-engine`, ten commits on top of
-upstream commit `e23cb9c`. Part 3 sits on the branch `feat/tabs`, which is
-built on `feat/cef-engine`. Nothing has been pushed.
+All of it sits on the branch `fork`, built on upstream commit `e23cb9c`.
+The branch `main` mirrors upstream and carries no changes of its own;
+upstream changes reach `fork` by merging or cherry-picking from `main`.
 
 For day-to-day usage, read [README.md](../README.md) and
 [AGENTS.md](../AGENTS.md). This document explains what changed and why.
@@ -31,22 +31,22 @@ console patch closes the first gap. The Chromium engine closes the second.
 
 | Commit | What it does |
 |---|---|
-| `14fb6f5` | Console capture, `html` command, window-pick fix (WebKit) |
-| `0d24e80` | Split the app into a shared core and a WebKit engine |
-| `adc59b1` | Add the Chromium engine as a second app |
-| `2a3cb61` | Route cookie commands and clicked links by engine |
-| `f5add8d` | Stop the Rex refresh storm; slow window polling when idle |
-| `84d230f` | Document and install the Chromium engine |
-| `616d1fa` | Fix load waits, token repair and CLI issues found in review |
-| `c26dbae` | Fix scripted click and press on Chromium panes |
-| `81260aa` | Add `rexweb cdp`; refuse a pane fragment matched in both apps |
-| `b3b8608` | Add this document |
-| `0cc8651` | Add tabs to the pane core (`feat/tabs`) |
-| `249a671` | Open links as tabs in WebKit panes |
-| `5cd19d6` | Open links as tabs in Chromium panes |
-| `c07bc78` | Add tab commands and `--tab` to the CLI |
-| `3141744` | Document tabs |
-| `f7296d8` | Fix tab defects found in review |
+| `3daf8cb` | Console capture, `html` command, window-pick fix (WebKit) |
+| `ab9ced3` | Split the app into a shared core and a WebKit engine |
+| `c669f5a` | Add the Chromium engine as a second app |
+| `199ca4b` | Route cookie commands and clicked links by engine |
+| `5296dcb` | Stop the Rex refresh storm; slow window polling when idle |
+| `fbb3eec` | Document and install the Chromium engine |
+| `d58f058` | Fix load waits, token repair and CLI issues found in review |
+| `c8c31ce` | Fix scripted click and press on Chromium panes |
+| `c2b0b73` | Add `rexweb cdp`; refuse a pane fragment matched in both apps |
+| `1ff1950` | Add this document |
+| `ec041eb` | Add tabs to the pane core |
+| `a81b604` | Open links as tabs in WebKit panes |
+| `ea9da5a` | Open links as tabs in Chromium panes |
+| `5140426` | Add tab commands and `--tab` to the CLI |
+| `4c05670` | Document tabs |
+| `a26e518` | Fix tab defects found in review |
 
 ## Part 1: console logging for WebKit panes
 
