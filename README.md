@@ -121,6 +121,7 @@ pane. Use `--no-wait` to skip the wait.
 | `Cmd-+` / `Cmd--` / `Cmd-0` | Zoom |
 | `Cmd-T` | New tab |
 | `Cmd-W` | Close the tab. On the last tab, close the pane |
+| `Cmd-Q` | Quit Rex, as in any other Rex pane |
 | `Ctrl-Tab` / `Ctrl-Shift-Tab` | Next tab / previous tab |
 | `Shift-Cmd-B` | Open another browser pane beside it |
 | `Cmd`-click a link | Open it in a new tab, behind this one |

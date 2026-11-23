@@ -1812,7 +1812,9 @@ final class App: NSObject, NSApplicationDelegate {
     let main = NSMenu()
     let appItem = NSMenuItem(); main.addItem(appItem)
     let appMenu = NSMenu(); appItem.submenu = appMenu
-    appMenu.addItem(withTitle: "Quit RexWeb", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    // Cmd-Q in a browser pane means what it means in any other Rex pane: quit Rex.
+    // Quitting this app instead would only blank every pane until the pane scripts restart it.
+    appMenu.addItem(withTitle: "Quit Rex", action: #selector(quitRex(_:)), keyEquivalent: "q").target = self
     let editItem = NSMenuItem(); main.addItem(editItem)
     let edit = NSMenu(title: "Edit"); editItem.submenu = edit
     edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
@@ -1865,9 +1867,21 @@ final class App: NSObject, NSApplicationDelegate {
     if let dir { Rex.async(["focus", "-s", p.session, "-b", p.id, dir]) }
   }
 
-  func activateRex() {
-    _ = NSRunningApplication.runningApplications(withBundleIdentifier: "com.superlogical.rex").first?.activate()
-      ?? NSWorkspace.shared.runningApplications.first { $0.localizedName?.hasPrefix("Rex") == true && $0.activationPolicy == .regular }?.activate()
+  var rexApp: NSRunningApplication? {
+    NSRunningApplication.runningApplications(withBundleIdentifier: "com.superlogical.rex").first
+      ?? NSWorkspace.shared.runningApplications.first {
+        $0.localizedName?.hasPrefix("Rex") == true && $0.localizedName?.hasPrefix("RexWeb") != true && $0.activationPolicy == .regular
+      }
+  }
+
+  func activateRex() { _ = rexApp?.activate() }
+
+  /// Asks Rex to quit, as Cmd-Q in Rex would. Rex comes forward first, so any
+  /// question it asks before quitting is on screen.
+  @objc func quitRex(_ sender: Any?) {
+    guard let rex = rexApp else { return }
+    rex.activate()
+    rex.terminate()
   }
 
   func focus(_ p: Panel) {

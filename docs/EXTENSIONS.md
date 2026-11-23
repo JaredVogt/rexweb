@@ -216,6 +216,7 @@ above the address bar, with a close button per tab and a `+` button.
 | `Cmd-Opt`-click a link | New pane beside |
 | `Cmd-T` | New blank tab at the end, with the address bar focused |
 | `Cmd-W` | Close the tab; on the last tab, close the pane |
+| `Cmd-Q` | Quit Rex, as in any other Rex pane (upstream quit the browser app, which blanked and reloaded every pane) |
 | `Ctrl-Tab`, `Ctrl-Shift-Tab` | Next and previous tab, wrapping round |
 
 ```sh
