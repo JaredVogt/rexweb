@@ -128,6 +128,7 @@ pane. Use `--no-wait` to skip the wait.
 | `Shift-Cmd`-click a link | Open it in a new tab, in front |
 | `Cmd-Opt`-click a link | Open it in a new pane beside this one |
 | `Ctrl-Opt-Arrow` | Move to the Rex pane in that direction |
+| `Shift-Cmd-H` / `J` / `K` / `L` | Move to the Rex pane to the left / below / above / right |
 | `` Ctrl-Opt-` `` | Back to Rex |
 
 Right-click and choose **Inspect Element** for Web Inspector. In a Chromium

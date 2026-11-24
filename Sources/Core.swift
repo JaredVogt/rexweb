@@ -1934,6 +1934,11 @@ final class App: NSObject, NSApplicationDelegate {
       if let dir { returnToRex(p, focus: dir); return true }
     }
     if m == [.control, .option], c == "`" { returnToRex(p, focus: nil); return true }
+    // Shift-Cmd-H/J/K/L move between panes, vim-style. Rex has no such default:
+    // these match a binding of the same keys to pane.focus.* in Rex's init.lua.
+    if m == [.command, .shift], let dir = ["h": "left", "j": "down", "k": "up", "l": "right"][c] {
+      returnToRex(p, focus: dir); return true
+    }
     return false
   }
 
