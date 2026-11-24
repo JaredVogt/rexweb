@@ -437,6 +437,8 @@ the pane headers. Floating panes and full screen work too.
 | `chromium_port` | Port of the local RexWebChromium server. Default 18803. |
 | `chromium_debug_port` | Port for the Chrome DevTools Protocol. Default 0, which means off. Read [the warning](#the-devtools-protocol-port) first. |
 | `tab_unload_minutes` | Minutes before an idle background [tab](#tabs) is put to sleep. Default 30. 0 turns it off. |
+| `settle_ms` | Milliseconds a pane stays hidden after it lands somewhere new, so it isn't drawn before Rex has put the pane there. Default 100. A floating pane's first placement waits half of it. |
+| `hide_on_resize` | `true` also hides a pane for `settle_ms` while it is only being resized or moved within its window. Default `false`: it follows at once. |
 
 If a pane sits off its place, set `top`, `left`, `right`, `bottom`, `gap`,
 `header`, or `radius`. Values are in points. They replace the values that

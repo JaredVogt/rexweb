@@ -16,13 +16,23 @@ fi
 PATH="$PATH:/usr/bin:/opt/homebrew/bin:/usr/local/bin"
 url="${1:-}"
 cfg="$HOME/.rexweb/config.json"
-engine="${REXWEB_ENGINE:-$(jq -r '.engine // "webkit"' "$cfg" 2>/dev/null || echo webkit)}"
+# One jq call reads all three config values, and none is needed when the
+# environment gives both. The defaults stand if the config can't be read.
+cfg_engine=webkit cfg_port=18802 cfg_chromium_port=18803
+if [ -z "${REXWEB_ENGINE:-}" ] || [ -z "${REXWEB_PORT:-}" ]; then
+  if cfg_vals="$(jq -r '.engine // "webkit", .port // 18802, .chromium_port // 18803' "$cfg" 2>/dev/null)"; then
+    { IFS= read -r cfg_engine; IFS= read -r cfg_port; IFS= read -r cfg_chromium_port; } <<<"$cfg_vals"
+    # An empty config file makes jq print nothing, which would empty all three.
+    : "${cfg_engine:=webkit}" "${cfg_port:=18802}" "${cfg_chromium_port:=18803}"
+  fi
+fi
+engine="${REXWEB_ENGINE:-$cfg_engine}"
 appname="RexWeb"
 if [ "$engine" = chromium ]; then
   appname="RexWebChromium"
-  port="${REXWEB_PORT:-$(jq -r '.chromium_port // 18803' "$cfg" 2>/dev/null || echo 18803)}"
+  port="${REXWEB_PORT:-$cfg_chromium_port}"
 else
-  port="${REXWEB_PORT:-$(jq -r '.port // 18802' "$cfg" 2>/dev/null || echo 18802)}"
+  port="${REXWEB_PORT:-$cfg_port}"
 fi
 id="${REX_BLOCK:?rexweb-pane must run inside a Rex pane}"
 session="${REX_SESSION:?rexweb-pane must run inside a Rex pane}"
@@ -66,21 +76,22 @@ ensure_app() {
   return 1
 }
 
+# Returns 1 without a usable answer, leaving the answer in reg_out for the caller.
+reg_out=""
 register() {
-  local out
-  out="$(post /register "$(jq -nc --arg id "$id" --arg s "$session" --arg u "$url" --argjson f "$focus" \
+  reg_out="$(post /register "$(jq -nc --arg id "$id" --arg s "$session" --arg u "$url" --argjson f "$focus" \
     '{id:$id, session:$s, url:$u, focus:$f}')")"
-  if jq -e '.id' >/dev/null 2>&1 <<<"$out"; then
-    show "rexweb · ${url:-blank}"
-  else
-    show "rexweb · couldn't register: $(jq -r '.error // "no answer"' <<<"$out" 2>/dev/null). Run: rexweb doctor"
-  fi
+  jq -e '.id' >/dev/null 2>&1 <<<"$reg_out" || return 1
+  show "rexweb · ${url:-blank}"
 }
 
 connect() {
+  # Register first: RexWeb is normally already running, which saves the health check.
+  register && return
   ensure_app
   case $? in
-    0) register ;;
+    0) register ||
+         show "rexweb · couldn't register: $(jq -r '.error // "no answer"' <<<"$reg_out" 2>/dev/null). Run: rexweb doctor" ;;
     2) show "rexweb · ${appname}.app isn't installed. Close this pane, or run ./install.sh"; missing=$((missing + 1)) ;;
   esac
 }

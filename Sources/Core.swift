@@ -17,6 +17,11 @@ struct Config {
   var linkTarget = "split"
   /// Minutes a background tab may sit unused before it is unloaded. 0 turns unloading off.
   var tabUnloadMinutes = 30.0
+  /// Seconds a pane stays hidden after it lands somewhere new, so it isn't
+  /// drawn before Rex has put the pane there.
+  var settle = 0.1
+  /// Whether a pane on show also hides while it is only being resized.
+  var hideOnResize = false
   var rexBin = ""
   var configError: String?
 
@@ -64,6 +69,10 @@ struct Config {
     if let m = n("tab_unload_minutes") {
       if m >= 0 { c.tabUnloadMinutes = m } else { c.configError = "tab_unload_minutes must be 0 (off) or more" }
     }
+    if let ms = n("settle_ms") {
+      if ms >= 0 && ms <= 2000 { c.settle = ms / 1000 } else { c.configError = "settle_ms must be from 0 to 2000" }
+    }
+    if let h = o["hide_on_resize"] as? Bool { c.hideOnResize = h }
     if let t = o["links"] as? String {
       if ["tab", "split"].contains(t) { c.linkTarget = t } else { c.configError = "links must be \"split\" or \"tab\"" }
     }
@@ -686,6 +695,9 @@ final class Panel: NSObject, NSTextFieldDelegate {
   var lastFrame = NSRect.zero
   var layoutKey = ""
   var settleUntil = Date.distantPast
+  /// The part of `layoutKey` that says where the pane lives: floating or
+  /// tiled, and in which Rex window.
+  var layoutHome = ""
   var lastActive = Date()
   var focusedInRex = false
   var pendingFocus = false
@@ -1215,6 +1227,8 @@ final class Tracker {
       self?.learnWindows()
     }
     Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in self?.refreshAll() }
+    // A press of the mouse may start a window drag or a resize.
+    NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in self?.wake(for: 1) }
     startEvents()
   }
 
@@ -1270,6 +1284,13 @@ final class Tracker {
     }
   }
 
+  /// Runs `tick` at the full rate for `seconds`, when something has moved or
+  /// is about to: without this an idle tracker notices up to a tenth of a
+  /// second late.
+  func wake(for seconds: TimeInterval) {
+    lastChange = max(lastChange, Date().addingTimeInterval(seconds - 1))
+  }
+
   func refreshAll() {
     for s in Set(App.shared.panels.values.map(\.session)) { refresh(s) }
   }
@@ -1278,22 +1299,42 @@ final class Tracker {
     if refreshing.contains(session) { dirty.insert(session); return }
     refreshing.insert(session)
     let ids = App.shared.panels.values.filter { $0.session == session }.map(\.id)
+    // Each question is its own `rex` process, so ask them all at once: the
+    // refresh then takes as long as the slowest one, not all of them in a row.
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var v: [String: Any]?
+    var shown: [String: Bool] = [:]
+    var grids: [String: Rex.Grid] = [:]
+    group.enter()
     Rex.queue.async {
-      let v = Rex.view(session)
-      var shown: [String: Bool] = [:]
-      var grids: [String: Rex.Grid] = [:]
-      for id in ids {
-        guard let sz = Rex.size(block: id, session: session) else { continue }
-        shown[id] = sz.displayed
-        if let g = sz.grid { grids[id] = g }
+      let view = Rex.view(session)
+      lock.lock(); v = view; lock.unlock()
+      group.leave()
+    }
+    for id in ids {
+      group.enter()
+      Rex.queue.async {
+        let sz = Rex.size(block: id, session: session)
+        lock.lock()
+        if let sz {
+          shown[id] = sz.displayed
+          if let g = sz.grid { grids[id] = g }
+        }
+        lock.unlock()
+        group.leave()
       }
-      DispatchQueue.main.async {
-        self.refreshing.remove(session)
-        for (id, d) in shown { self.displayed[id] = d }
-        for (id, g) in grids { self.grids[id] = g }
-        if let v { self.views[session] = v; self.reconcile(session) }
-        if self.dirty.remove(session) != nil { self.refresh(session) }
-      }
+    }
+    group.notify(queue: .main) {
+      self.refreshing.remove(session)
+      // Something moved or came on show: place it on the next tick, not
+      // on the idle rate's.
+      let moved = v.map { ($0 as NSDictionary) != (self.views[session] ?? [:]) as NSDictionary } ?? false
+      if moved || shown.contains(where: { self.displayed[$0.key] != $0.value }) { self.wake(for: 0.3) }
+      for (id, d) in shown { self.displayed[id] = d }
+      for (id, g) in grids { self.grids[id] = g }
+      if let v { self.views[session] = v; self.reconcile(session) }
+      if self.dirty.remove(session) != nil { self.refresh(session) }
     }
   }
 
@@ -1428,19 +1469,31 @@ final class Tracker {
       guard let rw = window(for: p, place, v, rexWins, primaryHeight) else { hide(p); continue }
 
       let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
+      let home = "\(place.floating) \(rw.number)"
       if key != p.layoutKey {
-        // A floating pane's first placement is where it stays, so it needs
-        // only a moment; anything else waits for Rex to finish moving panes.
-        let settle = p.layoutKey.isEmpty && place.floating ? 0.05 : 0.4
+        // A pane on show that only changed size or moved within its window
+        // (a divider dragged, a neighbour split) follows at once. One that
+        // lands somewhere new hides for a moment so it isn't drawn before
+        // Rex has put the pane there. A floating pane's first place is
+        // where it stays, so half of that is enough.
+        let resized = p.visible && home == p.layoutHome && !config.hideOnResize
         p.layoutKey = key
+        p.layoutHome = home
         lastChange = Date()
-        p.settleUntil = Date().addingTimeInterval(settle)
-        if p.window.isKeyWindow { p.pendingFocus = true }
+        if !resized {
+          let first = p.settleUntil == .distantPast
+          p.settleUntil = Date().addingTimeInterval(first && place.floating ? config.settle / 2 : config.settle)
+          if p.window.isKeyWindow { p.pendingFocus = true }
+        }
       }
       if Date() < p.settleUntil { hide(p); continue }
       let (body, radius) = Tracker.body(frac, floating: place.floating, in: rw.bounds, ins)
       if let l = p.window.contentView?.layer, l.cornerRadius != CGFloat(radius) { l.cornerRadius = CGFloat(radius) }
-      guard body.width > 20, body.height > 20 else { hide(p); continue }
+      guard body.width > 20, body.height > 20 else {
+        // Too small to draw. Remember the keyboard, which hiding takes away.
+        if p.window.isKeyWindow { p.pendingFocus = true }
+        hide(p); continue
+      }
       let x0 = (body.minX).rounded(.up), x1 = (body.maxX).rounded(.down)
       let y0 = (body.minY).rounded(.up), y1 = (body.maxY).rounded(.down)
       let ns = NSRect(x: x0, y: primaryHeight - y1, width: x1 - x0, height: y1 - y0)
