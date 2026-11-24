@@ -1429,9 +1429,12 @@ final class Tracker {
 
       let key = "\(frac) \(place.floating) \(ins) \(rw.number)"
       if key != p.layoutKey {
+        // A floating pane's first placement is where it stays, so it needs
+        // only a moment; anything else waits for Rex to finish moving panes.
+        let settle = p.layoutKey.isEmpty && place.floating ? 0.05 : 0.4
         p.layoutKey = key
         lastChange = Date()
-        p.settleUntil = Date().addingTimeInterval(0.4)
+        p.settleUntil = Date().addingTimeInterval(settle)
         if p.window.isKeyWindow { p.pendingFocus = true }
       }
       if Date() < p.settleUntil { hide(p); continue }
