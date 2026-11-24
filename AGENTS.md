@@ -68,8 +68,9 @@ rexweb close -b "$id"
   load. `nav` and `wait` exit 1 if the page fails to load.
 - `info --json` prints `{id, session, url, title, loading, visible, error}`,
   plus the tab fields described under [Tabs](#tabs).
-  `visible` turns false for about half a second while Rex rearranges panes,
-  so poll it rather than reading it once.
+  `visible` turns false for a moment when the pane lands somewhere new, such
+  as another Rex window (a tenth of a second by default; `settle_ms` in
+  `~/.rexweb/config.json`), so poll it rather than reading it once.
 - `console` prints each tab's last 1000 messages, oldest first: `console.*`
   calls, uncaught errors, unhandled rejections, failed resource loads,
   Content Security Policy blocks, and a `navigation` line per page load.
