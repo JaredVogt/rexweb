@@ -1549,9 +1549,38 @@ final class Tracker {
     pendingPair = (front.number, session)
   }
 
+  /// Which of Rex's windows, listed front to back, shows the session
+  /// labelled `label`: the frontmost one that could, or nil if none
+  /// clearly does.
+  ///
+  /// A window's title ends with its session's name, as "tab - session". But
+  /// two windows can show the same session, and the one that just gave the
+  /// keyboard to a pane of ours is titled with the app's name alone. Going by
+  /// title only then picks the other window, and the pane is drawn behind
+  /// the window it belongs to. So a window also counts when its title names
+  /// no other session and either it last had this session in front, or it
+  /// is the frontmost window and Rex says this session has the keyboard.
+  static func pick(label: String, session: String, windows: [RexWindow],
+                   windowSession: [Int: String], focusedSession: String?) -> Int? {
+    func named(_ w: RexWindow) -> Bool {
+      !w.name.isEmpty && (w.name == label || w.name.hasSuffix(" - \(label)"))
+    }
+    // A title with a session in it has " - " before the session's name.
+    func namesAnother(_ w: RexWindow) -> Bool { w.name.contains(" - ") && !named(w) }
+    return windows.indices.first { i in
+      let w = windows[i]
+      if named(w) { return true }
+      if namesAnother(w) { return false }
+      if windowSession[w.number] == session { return true }
+      return i == 0 && !w.name.isEmpty && session == focusedSession
+    }
+  }
+
   func window(for p: Panel, _ place: (rect: CGRect, floating: Bool), _ v: [String: Any], _ rexWins: [RexWindow], _ primaryHeight: CGFloat) -> RexWindow? {
     let label = v["label"] as? String ?? ""
-    if let w = rexWins.first(where: { !$0.name.isEmpty && ($0.name == label || $0.name.hasSuffix(" - \(label)")) }) { return w }
+    if let i = Tracker.pick(label: label, session: p.session, windows: rexWins, windowSession: windowSession, focusedSession: focusedSession) {
+      return rexWins[i]
+    }
     if let w = rexWins.first(where: { windowSession[$0.number] == p.session }) { return w }
     guard p.session == focusedSession else { return nil }
     let free = rexWins.filter { windowSession[$0.number] == nil }
